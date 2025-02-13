@@ -7,6 +7,8 @@
 
 """Utilities for setting-up embedded simulation of surfaces in hex meshes"""
 
+import functools
+
 import numpy as np
 import torch
 from kaolin.non_commercial import FlexiCubes
@@ -86,6 +88,13 @@ def regular_quadrature(cube, sdf, weight, clip=True, order=2):
     return qc, qw, active_cells
 
 
+@functools.cache
+def _load_model(model_path: str):
+    model = torch.jit.load(model_path)
+    model.eval()
+    return model
+
+
 def get_quadrature(model_path, cube, sdf, weight, clip=True, order=0):
     sdf = torch.tensor(sdf, device="cuda")
     cube = torch.tensor(cube, device="cuda")
@@ -94,125 +103,19 @@ def get_quadrature(model_path, cube, sdf, weight, clip=True, order=0):
     if model_path is None:
         qc, qw, active_cells = regular_quadrature(cube, sdf, weight, clip=clip, order=order)
     else:
-        model = torch.jit.load(model_path)
-        model.eval()
+        model = _load_model(model_path)
         qc, qw, active_cells = infer_quadrature(model, cube, sdf, weight)
 
-    qc_wp = wp.from_torch(qc, dtype=wp.vec3)
-    qw_wp = wp.from_torch(qw, dtype=wp.float32)
-    active_cells = wp.from_torch(active_cells.int(), dtype=wp.int32)
+    qc_wp = wp.clone(wp.from_torch(qc, dtype=wp.vec3, requires_grad=False))
+    qw_wp = wp.clone(wp.from_torch(qw, dtype=wp.float32, requires_grad=False))
+    active_cells = wp.clone(wp.from_torch(active_cells.int(), dtype=wp.int32, requires_grad=False))
 
     return qc_wp, qw_wp, active_cells
-
-
-@wp.kernel
-def surface_vertex_cell_index(
-    cube_vbeg: wp.array(dtype=int),
-    cube_nv: wp.array(dtype=int),
-    sorted_vidx: wp.array(dtype=int),
-    tri_vtx_cell_index: wp.array(dtype=int),
-):
-    # Map tri vertices to embedding cell index
-
-    c = wp.tid()
-    end = cube_vbeg[c]
-    beg = end - cube_nv[c]
-
-    for v in range(beg, end):
-        sorted_v = sorted_vidx[v]
-        tri_vtx_cell_index[sorted_v] = c
-
-
-@fem.integrand
-def surface_vertex_coords(
-    s: fem.Sample,
-    domain: fem.Domain,
-    vertex_pos: wp.array(dtype=wp.vec3),
-    vertex_coords: wp.array(dtype=fem.Coords),
-):
-    v = s.qp_index
-    v_pos = vertex_pos[v]
-
-    # dX/dc
-    coords = s.element_coords
-    for _k in range(64):
-        s = fem.types.make_free_sample(s.element_index, coords)
-        pos = domain(s)
-        F = fem.deformation_gradient(domain, s)
-
-        coords += 0.25 * wp.inverse(F) * (v_pos - pos)
-        coords = wp.vec3(
-            wp.clamp(coords[0], 0.0, 1.0),
-            wp.clamp(coords[1], 0.0, 1.0),
-            wp.clamp(coords[2], 0.0, 1.0),
-        )
-
-    err = wp.length(pos - v_pos)
-    if wp.length(pos - v_pos) > 0.1 * wp.cbrt(fem.measure(domain, s)):
-        wp.printf("Failed to embed vertex %d, error= %f \n", v, err)
-
-    vertex_coords[v] = coords
 
 
 @fem.integrand
 def surface_positions(s: fem.Sample, domain: fem.Domain, displacement: fem.Field):
     return domain(s) + displacement(s)
-
-
-def embed_tri_mesh(
-    domain: fem.GeometryDomain,
-    tri_vtx_pos,
-    bd_cubes,
-    bd_nv,
-):
-    """Embeds mesh vertices from a Flexicubes surface in a hexmesh
-
-    TODO: switch to using BVH queries instead of explicit indexing
-
-    Args:
-        tri_vtx_pos: points to embed
-        bd_cubes: indices of hexes containing points
-        bd_nv: number of points per hex
-    """
-
-    v_cell_idx = np.concatenate(
-        (
-            np.nonzero(bd_nv == 1),
-            np.repeat(np.nonzero(bd_nv == 2), 2),
-            np.repeat(np.nonzero(bd_nv == 3), 3),
-            np.repeat(np.nonzero(bd_nv == 4), 4),
-        ),
-        axis=None,
-    )
-
-    sorted_vidx = np.argsort(v_cell_idx)
-    sorted_vidx = wp.array(sorted_vidx, dtype=int)
-
-    cube_nv = np.zeros(domain.geometry_element_count(), dtype=int)
-    cube_vbeg = np.zeros(domain.geometry_element_count(), dtype=int)
-
-    cube_nv[bd_cubes] = bd_nv
-    cube_vbeg = np.cumsum(cube_nv)
-
-    cube_vbeg = wp.array(cube_vbeg, dtype=int)
-    cube_nv = wp.array(cube_nv, dtype=int)
-    tri_vtx_cell_index = wp.empty(shape=tri_vtx_pos.shape, dtype=int)
-
-    wp.launch(
-        surface_vertex_cell_index,
-        dim=cube_nv.shape[0],
-        inputs=[cube_vbeg, cube_nv, sorted_vidx, tri_vtx_cell_index],
-    )
-    tri_vtx_coords = wp.zeros_like(tri_vtx_pos)
-    vtx_quadrature = fem.PicQuadrature(domain=domain, positions=(tri_vtx_cell_index, tri_vtx_coords))
-
-    fem.interpolate(
-        surface_vertex_coords,
-        quadrature=vtx_quadrature,
-        values={"vertex_pos": tri_vtx_pos, "vertex_coords": tri_vtx_coords},
-    )
-
-    return vtx_quadrature
 
 
 def sim_from_flexicubes(sim_class, flexi, geo: fem.Grid3D, args):

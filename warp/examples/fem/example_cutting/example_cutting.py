@@ -11,12 +11,18 @@ import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 import torch
-from embedded_sim_utils import embed_tri_mesh, flexicubes_from_sdf_grid, sim_from_flexicubes, surface_positions
+from collisions import CollisionHandler
+from embedded_sim_utils import (
+    flexicubes_from_sdf_grid,
+    sim_from_flexicubes,
+    surface_positions,
+)
 from kaolin.io import import_mesh
 from softbody_sim import ClassicFEM
 
 import warp as wp
 import warp.fem as fem
+from warp.sim.collide import TRI_CONTACT_FEATURE_FACE_INTERIOR, triangle_closest_point
 
 
 def load_mesh(path):
@@ -105,6 +111,221 @@ def mesh_sdf_kernel(
         sdf[i] = 1.0
 
 
+@wp.kernel
+def detect_self_collisions(
+    cur_contacts: int,
+    max_contacts: int,
+    dt: float,
+    self_immunity_ratio: float,
+    mesh_id: wp.uint64,
+    mesh_rest_pos: wp.array(dtype=wp.vec3),
+    du_cur: wp.array(dtype=wp.vec3),
+    radius: float,
+    count: wp.array(dtype=int),
+    normals: wp.array(dtype=wp.vec3),
+    kinematic_gaps: wp.array(dtype=wp.vec3),
+    indices_a: wp.array(dtype=int),
+    indices_b: wp.array(dtype=int),
+    pos_b: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    mesh = wp.mesh_get(mesh_id)
+
+    x = mesh.points[tid]
+
+    lower = x - wp.vec3(radius)
+    upper = x + wp.vec3(radius)
+
+    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+
+    face_index = wp.int32(0)
+    while wp.mesh_query_aabb_next(query, face_index):
+        t0 = mesh.indices[3 * face_index + 0]
+        t1 = mesh.indices[3 * face_index + 1]
+        t2 = mesh.indices[3 * face_index + 2]
+        if tid == t0 or tid == t1 or tid == t2:
+            # Fast self collision
+            continue
+
+        u1 = mesh.points[t0]
+        u2 = mesh.points[t1]
+        u3 = mesh.points[t2]
+
+        cp, bary, feature_type = triangle_closest_point(u1, u2, u3, x)
+        if feature_type != TRI_CONTACT_FEATURE_FACE_INTERIOR:
+            continue
+
+        delta = x - cp
+
+        face_nor = wp.mesh_eval_face_normal(mesh_id, face_index)
+        sign = wp.select(wp.dot(delta, face_nor) > 0.0, -1.0, 1.0)
+
+        dist = wp.length(delta) * sign
+
+        if dist < radius:
+            # discard self-collisions of points that were very close at rest
+            rp0 = mesh_rest_pos[t0]
+            rp1 = mesh_rest_pos[t1]
+            rp2 = mesh_rest_pos[t2]
+            xb_rest = bary[0] * rp0 + bary[1] * rp1 + bary[2] * rp2
+            xa_rest = mesh_rest_pos[tid]
+            if wp.length(xb_rest - xa_rest) < self_immunity_ratio * radius:
+                continue
+
+            idx = wp.atomic_add(count, 0, 1)
+            if idx >= max_contacts:
+                return
+
+            if dist < 0.00001:
+                n = face_nor
+            else:
+                n = wp.normalize(delta) * sign
+            normals[idx] = n
+
+            du0 = du_cur[t0]
+            du1 = du_cur[t1]
+            du2 = du_cur[t2]
+            du = du_cur[tid] - du0 * bary[0] - du1 * bary[1] - du2 * bary[2]
+
+            kinematic_gap = (dist - wp.dot(du, n)) * n
+            kinematic_gaps[idx] = kinematic_gap
+            indices_a[idx] = tid
+            indices_b[idx] = mesh.points.shape[0] + idx - cur_contacts
+            pos_b[idx - cur_contacts] = xb_rest
+
+
+class SelfCollisionHandler(CollisionHandler):
+    def __init__(
+        self,
+        vtx_quadrature: fem.PicQuadrature,
+        tri_mesh: wp.Mesh,
+        sim: ClassicFEM,
+    ):
+        super().__init__([], vtx_quadrature.cell_indices, vtx_quadrature.particle_coords, sim)
+
+        self.tri_vtx_quadrature = vtx_quadrature
+        self.vtx_rest_pos = wp.clone(tri_mesh.points)
+        self.tri_mesh = tri_mesh
+
+    @staticmethod
+    def add_parser_arguments(parser: argparse.ArgumentParser):
+        CollisionHandler.add_parser_arguments(parser)
+        parser.add_argument(
+            "--self_immunity_radius_ratio",
+            "-cs",
+            type=float,
+            default=4.0,
+            help="Ignore self-collision for particles that were within this ratio at rest",
+        )
+
+    def run_collision_detectors(
+        self,
+        dt,
+        count,
+        indices_a,
+        indices_b,
+        normals,
+        kinematic_gaps,
+    ):
+        self.set_collision_quadrature(self.tri_vtx_quadrature)
+
+        super().run_collision_detectors(
+            dt,
+            count,
+            indices_a,
+            indices_b,
+            normals,
+            kinematic_gaps,
+        )
+
+        self.cp_world_position(dest=self.tri_mesh.points)
+        self.tri_mesh.refit()
+
+        cp_du = self._sample_cp_displacement(self.sim.du_field)
+
+        n_cp = cp_du.shape[0]
+        max_contacts = self.collision_normals.shape[0]
+
+        collision_radius = self.args.collision_radius * self.args.collision_detection_ratio
+
+        start_contacts = count.numpy()[0]
+        pos_b = wp.empty(indices_b.shape, dtype=wp.vec3)
+
+        wp.launch(
+            detect_self_collisions,
+            dim=(n_cp),
+            inputs=[
+                start_contacts,
+                max_contacts,
+                dt,
+                self.args.self_immunity_radius_ratio,
+                self.tri_mesh.id,
+                self.vtx_rest_pos,
+                cp_du,
+                collision_radius,
+                count,
+                normals,
+                kinematic_gaps,
+                indices_a,
+                indices_b,
+                pos_b,
+            ],
+        )
+        self_contacts = int(min(max_contacts, count.numpy()[0]) - start_contacts)
+
+        if self_contacts > 0:
+            contact_points = wp.empty(n_cp + self_contacts, dtype=wp.vec3)
+            wp.copy(contact_points[:n_cp], self.vtx_rest_pos)
+            wp.copy(contact_points[n_cp:], pos_b[:self_contacts])
+
+            quadrature = fem.PicQuadrature(fem.Cells(self.sim.geo.base), contact_points)
+            quadrature.domain = self.collision_quadrature.domain
+            self.set_collision_quadrature(quadrature)
+
+
+class SelfCollidingSim(ClassicFEM):
+    @staticmethod
+    def add_parser_arguments(parser: argparse.ArgumentParser):
+        ClassicFEM.add_parser_arguments(parser)
+        SelfCollisionHandler.add_parser_arguments(parser)
+
+    def compute_initial_guess(self):
+        self.du_field.dof_values.zero_()
+        self.collision_handler.detect_collisions(self.dt)
+
+    def evaluate_energy(self):
+        E_p, c_r = super().evaluate_energy()
+
+        E_p = self.collision_handler.add_collision_energy(E_p)
+
+        return E_p, c_r
+
+    def newton_lhs(self):
+        lhs = super().newton_lhs()
+        self.collision_handler.add_collision_hessian(lhs)
+        fem.dirichlet.project_system_matrix(lhs, self.v_bd_matrix)
+
+        return lhs
+
+    def newton_rhs(self, tape=None):
+        rhs = super().newton_rhs(tape)
+        self.collision_handler.add_collision_forces(rhs)
+        self._filter_forces(rhs)
+        return rhs
+
+    def prepare_newton_step(self, tape=None):
+        self.collision_handler.prepare_newton_step(self.dt)
+
+        return super().prepare_newton_step(tape)
+
+    def init_collision_detector(
+        self,
+        vtx_quadrature: fem.PicQuadrature,
+        tri_mesh: wp.Mesh,
+    ):
+        self.collision_handler = SelfCollisionHandler(vtx_quadrature, tri_mesh, self)
+
+
 class Clay:
     """Utility struct for storing simulation state"""
 
@@ -130,7 +351,7 @@ class Clay:
             prev_velocity = None
 
         # (Re)create simulation
-        self.sim = sim_from_flexicubes(ClassicFEM, flexicubes, geo, args)
+        self.sim = sim_from_flexicubes(SelfCollidingSim, flexicubes, geo, args)
         self.sim.set_fixed_points_condition(
             fixed_points_projector_form,
         )
@@ -147,15 +368,16 @@ class Clay:
             fem.interpolate(prev_velocity_field, dest=self.sim.du_field)
 
         # Embed triangle mesh
-        fc_bd_cubes = flexicubes["fc_bd_cubes"]
-        fc_bd_nv = flexicubes["fc_bd_nv"]
         tri_vertices = flexicubes["tri_vertices"]
         tri_faces = wp.array(flexicubes["tri_faces"], dtype=int).flatten()
         tri_vtx_pos = wp.array(tri_vertices, dtype=wp.vec3)
 
         self.tri_mesh = wp.Mesh(tri_vtx_pos, tri_faces)
         self.rest_points = wp.clone(tri_vtx_pos)
-        self.surface_vtx_quadrature = embed_tri_mesh(self.sim.u_test.domain, tri_vtx_pos, fc_bd_cubes, fc_bd_nv)
+        self.surface_vtx_quadrature = fem.PicQuadrature(fem.Cells(geo), tri_vtx_pos)
+        self.surface_vtx_quadrature.domain = self.sim.u_test.domain
+
+        self.sim.init_collision_detector(self.surface_vtx_quadrature, self.tri_mesh)
 
     def world_to_rest_pos(self, world_pos):
         tri_mesh = self.tri_mesh
@@ -181,12 +403,15 @@ if __name__ == "__main__":
     parser.add_argument("--force_scale", type=float, default=1.0)
     parser.add_argument("--resolution", type=int, default=64)
 
-    ClassicFEM.add_parser_arguments(parser)
+    SelfCollidingSim.add_parser_arguments(parser)
     args = parser.parse_args()
 
     # fall back to full-cell quadrature if neural model not provided
     args.reg_qp = 2 if args.quadrature_model is None else 0
     args.clip = False
+
+    args.ground_height = -1.0
+    args.collision_radius = 0.5 / args.resolution
 
     res = args.resolution
     geo = fem.Grid3D(res=wp.vec3i(res), bounds_lo=wp.vec3(-1), bounds_hi=wp.vec3(1))
@@ -276,6 +501,11 @@ if __name__ == "__main__":
         )
         surf_mesh = ps.get_surface_mesh("surf")
         surf_mesh.update_vertex_positions(clay.tri_mesh.points.numpy())
+
+        ps.register_point_cloud(
+            "collisions",
+            sim.collision_handler.cp_world_position().numpy()[clay.tri_mesh.points.shape[0] :],
+        )
 
         # Dynamic picking force
         # (shift + click)
