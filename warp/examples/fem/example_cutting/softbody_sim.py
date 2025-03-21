@@ -11,15 +11,20 @@ import argparse
 from typing import Optional
 
 import numpy as np
-from elastic_models import (
-    snh_energy,
-    snh_hessian_proj_analytic,
-    snh_stress,
-)
 
 import warp as wp
 import warp.fem as fem
 import warp.sparse as sp
+from warp.examples.fem.example_cutting.elastic_models import (
+    hooke_energy,
+    hooke_hessian,
+    hooke_stress,
+    snh_energy,
+    snh_hessian_proj_analytic,
+    snh_stress,
+    symmetric_strain,
+    symmetric_strain_delta,
+)
 from warp.examples.fem.utils import bsr_cg
 from warp.fem import Domain, Field, Sample
 from warp.fem.utils import array_axpy
@@ -596,6 +601,7 @@ class SoftbodySim:
         parser.add_argument("-ss", "--step_size", type=float, default=0.001)
         parser.add_argument("--quiet", action="store_true", default=False)
         parser.add_argument("--lumped_mass", action=argparse.BooleanOptionalAction)
+        parser.add_argument("-nh", "--neo_hookean", action=argparse.BooleanOptionalAction)
         parser.add_argument("--fp64", action="store_true", default=False)
 
 
@@ -604,6 +610,18 @@ class ClassicFEM(SoftbodySim):
         super().__init__(geo, active_cells, args)
 
         self._ls = LineSearchUnconstrainedArmijoCriterion(self)
+
+        self._make_elasticity_forms()
+
+    def _make_elasticity_forms(self):
+        if self.args.neo_hookean:
+            self.elastic_energy = ClassicFEM.nh_elastic_energy
+            self.elastic_forces = ClassicFEM.nh_elastic_forces
+            self.elasticity_hessian = ClassicFEM.nh_elasticity_hessian
+        else:
+            self.elastic_energy = ClassicFEM.cr_elastic_energy
+            self.elastic_forces = ClassicFEM.cr_elastic_forces
+            self.elasticity_hessian = ClassicFEM.cr_elasticity_hessian
 
     def evaluate_energy(self):
         E_u, c_r = super().evaluate_energy()
@@ -704,22 +722,45 @@ class ClassicFEM(SoftbodySim):
         return (res,)
 
     @fem.integrand
-    def elastic_energy(s: Sample, u_cur: Field, lame: Field):
+    def nh_elastic_energy(s: Sample, u_cur: Field, lame: Field):
         F = defgrad(u_cur, s)
         return snh_energy(F, lame(s))
 
     @fem.integrand
-    def elastic_forces(s: Sample, u_cur: Field, v: Field, lame: Field):
+    def nh_elastic_forces(s: Sample, u_cur: Field, v: Field, lame: Field):
         F = defgrad(u_cur, s)
         tau = fem.grad(v, s)
 
         return -wp.ddot(tau, snh_stress(F, lame(s)))
 
     @fem.integrand
-    def elasticity_hessian(s: Sample, u_cur: Field, u: Field, v: Field, lame: Field):
+    def nh_elasticity_hessian(s: Sample, u_cur: Field, u: Field, v: Field, lame: Field):
         F_s = defgrad(u_cur, s)
         tau_s = fem.grad(v, s)
         sig_s = fem.grad(u, s)
         lame_s = lame(s)
 
         return snh_hessian_proj_analytic(F_s, tau_s, sig_s, lame_s)
+
+    @fem.integrand
+    def cr_elastic_energy(s: Sample, u_cur: Field, lame: Field):
+        F = defgrad(u_cur, s)
+        S = symmetric_strain(F)
+        return hooke_energy(S, lame(s))
+
+    @fem.integrand
+    def cr_elastic_forces(s: Sample, u_cur: Field, v: Field, lame: Field):
+        F = defgrad(u_cur, s)
+        S = symmetric_strain(F)
+        tau = symmetric_strain_delta(F, fem.grad(v, s))
+        return -wp.ddot(tau, hooke_stress(S, lame(s)))
+
+    @fem.integrand
+    def cr_elasticity_hessian(s: Sample, u_cur: Field, u: Field, v: Field, lame: Field):
+        F_s = defgrad(u_cur, s)
+        S_s = symmetric_strain(F_s)
+        tau_s = symmetric_strain_delta(F_s, fem.grad(v, s))
+        sig_s = symmetric_strain_delta(F_s, fem.grad(u, s))
+        lame_s = lame(s)
+
+        return hooke_hessian(S_s, tau_s, sig_s, lame_s)
