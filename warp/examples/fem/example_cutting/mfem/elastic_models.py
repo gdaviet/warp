@@ -1,9 +1,17 @@
-# Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import math
 
@@ -11,16 +19,16 @@ import warp as wp
 
 __all__ = [
     "hooke_energy",
-    "hooke_stress",
     "hooke_hessian",
+    "hooke_stress",
     "nh_energy",
-    "nh_stress",
     "nh_hessian_proj",
     "nh_hessian_proj_analytic",
+    "nh_stress",
     "snh_energy",
-    "snh_stress",
     "snh_hessian_proj",
     "snh_hessian_proj_analytic",
+    "snh_stress",
 ]
 
 _SQRT_1_2 = wp.constant(math.sqrt(1.0 / 2.0))
@@ -302,15 +310,35 @@ def _depressed_cubic_roots(p: float, q: float):
 
 
 @wp.func
+def symmetric_strain(sig: wp.vec3, V: wp.mat33):
+    return V * wp.diag(sig) * wp.transpose(V)
+
+
+@wp.func
 def symmetric_strain(F: wp.mat33):
     U = wp.mat33()
     sig = wp.vec3()
     V = wp.mat33()
     wp.svd3(F, U, sig, V)
 
-    S = V * wp.diag(sig) * wp.transpose(V)
+    return symmetric_strain(sig, V)
 
-    return S
+
+@wp.func
+def symmetric_strain_delta(U: wp.mat33, sig: wp.vec3, V: wp.mat33, dF: wp.mat33):
+    # see supplementary of `WRAPD: Weighted Rotation-aware ADMM`, Brown and Narain 21
+
+    Ut = wp.transpose(U)
+    Vt = wp.transpose(V)
+
+    dF_loc = Ut * dF * V
+    SigdF_loc = wp.diag(sig) * dF_loc
+
+    sig_op = wp.matrix_from_cols(wp.vec3(sig[0]), wp.vec3(sig[1]), wp.vec3(sig[2]))
+    dSig = wp.cw_div(SigdF_loc + wp.transpose(SigdF_loc), sig_op + wp.transpose(sig_op))
+    dS = V * dSig * Vt
+
+    return dS
 
 
 @wp.func
@@ -322,14 +350,4 @@ def symmetric_strain_delta(F: wp.mat33, dF: wp.mat33):
     V = wp.mat33()
     wp.svd3(F, U, sig, V)
 
-    Ut = wp.transpose(U)
-    Vt = wp.transpose(V)
-
-    dF_loc = Ut * dF * V
-    SigdF_loc = wp.diag(sig) * dF_loc
-
-    sig_op = wp.mat33(wp.vec3(sig[0]), wp.vec3(sig[1]), wp.vec3(sig[2]))
-    dSig = wp.cw_div(SigdF_loc + wp.transpose(SigdF_loc), sig_op + wp.transpose(sig_op))
-    dS = V * dSig * Vt
-
-    return dS
+    return symmetric_strain_delta(U, sig, V, dF)
