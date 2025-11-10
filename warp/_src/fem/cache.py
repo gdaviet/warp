@@ -418,7 +418,8 @@ the temporary is explicitly detached from the pool using :meth:`detach`.
 The temporary may also be explicitly returned to the pool before destruction using :meth:`release`.
 
 Note: `Temporary` is now a direct alias for `wp.array` with a custom deleter. Convenience `detach` and `release`
-are added at borrow time, as well as a self-pointing `array` attribute is for backward compatibility.
+are added at borrow time. A self-pointing `array` attribute is also added for backward compatibility, but is
+deprecated and will be removed in Warp 1.12.
 """
 
 
@@ -565,8 +566,16 @@ class TemporaryStore:
         temporary.detach = TemporaryStore._detach_temporary.__get__(ref)
 
         # Deprecated -- to be removed in 1.12
-        if not hasattr(temporary.__class__, "array"):
-            temporary.__class__.array = property(TemporaryStore._temporary_self_array)
+        temporary.array = wp.array(
+            ptr=temporary.ptr,
+            capacity=temporary.capacity,
+            shape=temporary.shape,
+            dtype=temporary.dtype,
+            grad=temporary.grad,
+            device=temporary.device,
+            pinned=temporary.pinned,
+            deleter=None,
+        )
 
         return temporary
 
@@ -593,14 +602,6 @@ class TemporaryStore:
             with temporary.device.context_guard:
                 temporary.deleter(temporary.ptr, temporary.capacity)
             temporary.deleter = None
-
-    @staticmethod
-    def _temporary_self_array(temporary: Temporary) -> wp.array:
-        warn(
-            "The `.array` attribute of temporary arrays is deprecated, use the array itself",
-            category=DeprecationWarning,
-        )
-        return temporary
 
 
 def set_default_temporary_store(temporary_store: Optional[TemporaryStore]):
