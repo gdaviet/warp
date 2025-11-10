@@ -571,7 +571,7 @@ class TemporaryStore:
         return temporary
 
     @staticmethod
-    def _detach_temporary(temporary_ref: weakref.ReferenceType[Temporary]) -> Temporary:
+    def _detach_temporary(temporary_ref: "weakref.ReferenceType[Temporary]") -> Temporary:
         """Detaches the temporary so it is never returned to the pool"""
         temporary = temporary_ref()
         if temporary is None:
@@ -583,7 +583,7 @@ class TemporaryStore:
         return temporary
 
     @staticmethod
-    def _release_temporary(temporary_ref: weakref.ReferenceType[Temporary]):
+    def _release_temporary(temporary_ref: "weakref.ReferenceType[Temporary]"):
         """Returns the temporary array to the pool"""
         temporary = temporary_ref()
         if temporary is None:
