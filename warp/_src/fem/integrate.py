@@ -1484,9 +1484,9 @@ def _launch_integrate_kernel(
     else:
         nnz = test.space_restriction.total_node_element_count() * trial.space.topology.MAX_NODES_PER_ELEMENT
 
-    triplet_rows_temp = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_cols_temp = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_values_temp = cache.borrow_temporary(
+    triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+    triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+    triplet_values = cache.borrow_temporary(
         temporary_store,
         shape=(
             nnz,
@@ -1496,9 +1496,6 @@ def _launch_integrate_kernel(
         dtype=output_dtype,
         device=device,
     )
-    triplet_cols = triplet_cols_temp.array
-    triplet_rows = triplet_rows_temp.array
-    triplet_values = triplet_values_temp.array
 
     if nodal:
         wp.launch(
@@ -1636,9 +1633,9 @@ def _launch_integrate_kernel(
     bsr_set_from_triplets(bsr_result, triplet_rows, triplet_cols, triplet_values, **(bsr_options or {}))
 
     # Do not wait for garbage collection
-    triplet_values_temp.release()
-    triplet_rows_temp.release()
-    triplet_cols_temp.release()
+    triplet_values.release()
+    triplet_rows.release()
+    triplet_cols.release()
 
     if add_to_output:
         output += bsr_result
@@ -2359,17 +2356,14 @@ def _launch_interpolate_kernel(
     if dest.block_shape[1] != trial.node_dof_count:
         raise RuntimeError(f"'dest' matrix blocks must have {trial.node_dof_count} columns")
 
-    triplet_rows_temp = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_cols_temp = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_values_temp = cache.borrow_temporary(
+    triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+    triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+    triplet_values = cache.borrow_temporary(
         temporary_store,
         dtype=dest.scalar_type,
         shape=(nnz, *dest.block_shape),
         device=device,
     )
-    triplet_cols = triplet_cols_temp.array
-    triplet_rows = triplet_rows_temp.array
-    triplet_values = triplet_values_temp.array
     triplet_rows.fill_(-1)
 
     trial_partition_arg = trial.space_partition.partition_arg_value(device)
@@ -2395,6 +2389,10 @@ def _launch_interpolate_kernel(
     )
 
     bsr_set_from_triplets(dest, triplet_rows, triplet_cols, triplet_values, **(bsr_options or {}))
+
+    triplet_values.release()
+    triplet_rows.release()
+    triplet_cols.release()
 
 
 @integrand

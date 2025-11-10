@@ -560,26 +560,47 @@ class TemporaryStore:
 
     @staticmethod
     def add_temporary_convenience_methods(temporary: wp.array) -> Temporary:
-        temporary.release = TemporaryStore._release_temporary.__get__(temporary)
-        temporary.detach = TemporaryStore._detach_temporary.__get__(temporary)
-        temporary.array = temporary
+        ref = weakref.ref(temporary)
+        temporary.release = TemporaryStore._release_temporary.__get__(ref)
+        temporary.detach = TemporaryStore._detach_temporary.__get__(ref)
+
+        # Deprecated -- to be removed in 1.12
+        if not hasattr(temporary.__class__, "array"):
+            temporary.__class__.array = property(TemporaryStore._temporary_self_array)
+
         return temporary
 
     @staticmethod
-    def _detach_temporary(temporary) -> wp.array:
+    def _detach_temporary(temporary_ref: weakref.ReferenceType[Temporary]) -> Temporary:
         """Detaches the temporary so it is never returned to the pool"""
+        temporary = temporary_ref()
+        if temporary is None:
+            return None
+
         if temporary.deleter is not None:
             if isinstance(temporary.deleter, TemporaryStore.Pool.Deleter):
                 temporary.deleter.detach(temporary)
         return temporary
 
     @staticmethod
-    def _release_temporary(temporary):
+    def _release_temporary(temporary_ref: weakref.ReferenceType[Temporary]):
         """Returns the temporary array to the pool"""
+        temporary = temporary_ref()
+        if temporary is None:
+            return
+
         if temporary.deleter is not None:
             with temporary.device.context_guard:
                 temporary.deleter(temporary.ptr, temporary.capacity)
             temporary.deleter = None
+
+    @staticmethod
+    def _temporary_self_array(temporary: Temporary) -> wp.array:
+        warn(
+            "The `.array` attribute of temporary arrays is deprecated, use the array itself",
+            category=DeprecationWarning,
+        )
+        return temporary
 
 
 def set_default_temporary_store(temporary_store: Optional[TemporaryStore]):
