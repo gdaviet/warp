@@ -26,6 +26,10 @@ class LinearOperator:
         dtype: Type of the operator elements
         device: Device on which computations involving the operator should be performed
         matvec: Matrix-vector multiplication routine
+        batch_offsets: Optional array of shape ``(B+1,)`` partitioning the rows into ``B``
+            independent subproblems. ``batch_offsets[i]`` is the first row of subproblem ``i``
+            and ``batch_offsets[B]`` equals ``shape[0]``. When ``None`` (default) the operator
+            represents a single subproblem.
 
     The matrix-vector multiplication routine should have the following signature:
 
@@ -45,11 +49,19 @@ class LinearOperator:
 
     """
 
-    def __init__(self, shape: tuple[int, int], dtype: type, device: wp._src.context.Device, matvec: Callable):
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        dtype: type,
+        device: wp._src.context.Device,
+        matvec: Callable,
+        batch_offsets: wp.array | None = None,
+    ):
         self._shape = shape
         self._dtype = dtype
         self._device = device
         self._matvec = matvec
+        self._batch_offsets = batch_offsets
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -71,11 +83,21 @@ class LinearOperator:
     def scalar_type(self):
         return wp._src.types.type_scalar_type(self.dtype)
 
+    @property
+    def batch_offsets(self) -> wp.array | None:
+        """Array of length ``batch_count + 1`` partitioning rows into independent subproblems, or ``None``."""
+        return self._batch_offsets
+
+    @property
+    def batch_count(self) -> int:
+        """Number of independent subproblems. ``1`` when :attr:`batch_offsets` is ``None``."""
+        return 1 if self._batch_offsets is None else self._batch_offsets.shape[0] - 1
+
 
 _Matrix = wp.array | sparse.BsrMatrix | LinearOperator
 
 
-def aslinearoperator(A: _Matrix) -> LinearOperator:
+def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> LinearOperator:
     """Cast the dense or sparse matrix ``A`` as a :class:`LinearOperator`.
 
     ``A`` must be of one of the following types:
@@ -83,7 +105,12 @@ def aslinearoperator(A: _Matrix) -> LinearOperator:
         - :class:`warp.sparse.BsrMatrix`
         - two-dimensional ``warp.array``; then ``A`` is assumed to be a dense matrix
         - one-dimensional ``warp.array``; then ``A`` is assumed to be a diagonal matrix
-        - :class:`warp.optim.linear.LinearOperator`; no casting necessary
+        - :class:`warp.optim.linear.LinearOperator`; no casting necessary, ``batch_offsets`` is ignored
+
+    Args:
+        A: The matrix to wrap.
+        batch_offsets: Optional array of shape ``(B+1,)`` partitioning the rows of ``A`` into
+            ``B`` independent subproblems (see :class:`LinearOperator`).
     """
 
     if A is None or isinstance(A, LinearOperator):
@@ -125,13 +152,13 @@ def aslinearoperator(A: _Matrix) -> LinearOperator:
 
     if isinstance(A, wp.array):
         if A.ndim == 2:
-            return LinearOperator(A.shape, A.dtype, A.device, matvec=dense_mv)
+            return LinearOperator(A.shape, A.dtype, A.device, matvec=dense_mv, batch_offsets=batch_offsets)
         if A.ndim == 1:
             if wp._src.types.type_is_vector(A.dtype):
-                return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv_vec)
-            return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv)
+                return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv_vec, batch_offsets=batch_offsets)
+            return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv, batch_offsets=batch_offsets)
     if isinstance(A, sparse.BsrMatrix):
-        return LinearOperator(A.shape, A.dtype, A.device, matvec=bsr_mv)
+        return LinearOperator(A.shape, A.dtype, A.device, matvec=bsr_mv, batch_offsets=batch_offsets)
 
     raise ValueError(f"Unable to create LinearOperator from {A}")
 
@@ -208,53 +235,106 @@ def _as_scalar_array(x: wp.array):
 
 
 class TiledDot:
-    """Compute the dot product of two arrays in a way that is compatible with CUDA sub-graphs."""
+    """Compute the dot product of two arrays in a way that is compatible with CUDA sub-graphs.
 
-    def __init__(self, max_length: int, scalar_type: type, tile_size=512, device=None, max_column_count: int = 1):
+    Args:
+        max_length: Total length of the arrays to dot (sum of all subproblem lengths).
+        scalar_type: Scalar data type of the arrays.
+        tile_size: Number of threads per tile/block.
+        device: Device on which to allocate scratch memory and launch kernels.
+        max_column_count: Maximum number of simultaneous dot products.
+        batch_offsets: Optional array of shape ``(B+1,)`` partitioning the array into ``B``
+            independent subproblems. When provided, :meth:`compute` returns ``B`` independent
+            dot products rather than a single global one.
+        max_batch_len: Optional hint for the maximum subproblem length. Has no effect on
+            memory allocation; only used to compute the number of tree-reduction rounds
+            in the non-batched path if applicable.
+    """
+
+    def __init__(
+        self,
+        max_length: int,
+        scalar_type: type,
+        tile_size=512,
+        device=None,
+        max_column_count: int = 1,
+        batch_offsets: wp.array | None = None,
+        max_batch_len: int | None = None,
+    ):
         self.tile_size = tile_size
         self.device = device
         self.max_column_count = max_column_count
+        self.batch_offsets = batch_offsets
+        self.batch_count = 1 if batch_offsets is None else batch_offsets.shape[0] - 1
 
         num_blocks = (max_length + self.tile_size - 1) // self.tile_size
+        # Scratch must hold at least batch_count result slots per column (one per subproblem)
+        scratch_size = max(num_blocks, self.batch_count)
         scratch = wp.empty(
-            shape=(2, max_column_count, num_blocks),
+            shape=(2, max_column_count, scratch_size),
             dtype=scalar_type,
             device=self.device,
         )
         self.partial_sums_a = scratch[0]
         self.partial_sums_b = scratch[1]
 
-        self.dot_kernel, self.sum_kernel = _create_tiled_dot_kernels(self.tile_size)
+        if batch_offsets is None:
+            # Non-batched: tiled tree reduction (unchanged from original)
+            self.dot_kernel, self.sum_kernel = _create_tiled_dot_kernels(self.tile_size)
 
-        rounds = 0
-        length = num_blocks
-        while length > 1:
-            length = (length + self.tile_size - 1) // self.tile_size
-            rounds += 1
+            effective_len = max_batch_len if max_batch_len is not None else max_length
+            rounds = 0
+            length = (effective_len + self.tile_size - 1) // self.tile_size
+            while length > 1:
+                length = (length + self.tile_size - 1) // self.tile_size
+                rounds += 1
 
-        self.rounds = rounds
+            self.rounds = rounds
+            self._output = self.partial_sums_a if rounds % 2 == 0 else self.partial_sums_b
 
-        self._output = self.partial_sums_a if rounds % 2 == 0 else self.partial_sums_b
+            self.dot_launch: wp.Launch = wp.launch(
+                self.dot_kernel,
+                dim=(max_column_count, num_blocks, self.tile_size),
+                inputs=(self.partial_sums_a, self.partial_sums_b),
+                outputs=(self.partial_sums_a,),
+                block_dim=self.tile_size,
+                record_cmd=True,
+            )
+            self.sum_launch: wp.Launch = wp.launch(
+                self.sum_kernel,
+                dim=(max_column_count, num_blocks, self.tile_size),
+                inputs=(self.partial_sums_a,),
+                outputs=(self.partial_sums_b,),
+                block_dim=self.tile_size,
+                record_cmd=True,
+            )
+            self.batch_dot_launch = None
+        else:
+            # Batched: direct per-subproblem reduction in one kernel, no tree rounds needed.
+            # Each subproblem's threads loop over their DOF range and reduce cooperatively.
+            self.rounds = 0
+            self._output = self.partial_sums_a  # rounds=0 → always written to partial_sums_a
+            self.dot_launch = None
+            self.sum_launch = None
 
-        self.dot_launch: wp.Launch = wp.launch(
-            self.dot_kernel,
-            dim=(max_column_count, num_blocks, self.tile_size),
-            inputs=(self.partial_sums_a, self.partial_sums_b),
-            outputs=(self.partial_sums_a,),
-            block_dim=self.tile_size,
-            record_cmd=True,
-        )
-        self.sum_launch: wp.Launch = wp.launch(
-            self.sum_kernel,
-            dim=(max_column_count, num_blocks, self.tile_size),
-            inputs=(self.partial_sums_a,),
-            outputs=(self.partial_sums_b,),
-            block_dim=self.tile_size,
-            record_cmd=True,
-        )
+            batch_dot_kernel = _create_batched_dot_kernel(self.tile_size)
+            self.batch_dot_launch: wp.Launch = wp.launch(
+                batch_dot_kernel,
+                dim=(max_column_count, self.batch_count, self.tile_size),
+                inputs=[self.partial_sums_a, self.partial_sums_a, self.partial_sums_a, batch_offsets],
+                block_dim=self.tile_size,
+                device=self.device,
+                record_cmd=True,
+            )
 
-    # Result contains a single value, the sum of the array (will get updated by this function)
     def compute(self, a: wp.array, b: wp.array, col_offset: int = 0):
+        """Compute dot products, updating results accessible via :meth:`col` and :meth:`cols`.
+
+        Args:
+            a: First array operand (1-D or 2-D with leading column dimension).
+            b: Second array operand, same shape as ``a``.
+            col_offset: Column index in the scratch at which to write results.
+        """
         a = _as_scalar_array(a)
         b = _as_scalar_array(b)
         if a.ndim == 1:
@@ -263,34 +343,45 @@ class TiledDot:
             b = b.reshape((1, -1))
 
         column_count = a.shape[0]
-        num_blocks = (a.shape[1] + self.tile_size - 1) // self.tile_size
-
         data_out = self.partial_sums_a[col_offset : col_offset + column_count]
         data_in = self.partial_sums_b[col_offset : col_offset + column_count]
 
-        self.dot_launch.set_param_at_index(0, a)
-        self.dot_launch.set_param_at_index(1, b)
-        self.dot_launch.set_param_at_index(2, data_out)
-        self.dot_launch.set_dim((column_count, num_blocks, self.tile_size))
-        self.dot_launch.launch()
+        if self.batch_dot_launch is not None:
+            # Batched path: one block per (col, batch_id) with tile_size lanes
+            self.batch_dot_launch.set_param_at_index(0, a)
+            self.batch_dot_launch.set_param_at_index(1, b)
+            self.batch_dot_launch.set_param_at_index(2, data_out)
+            self.batch_dot_launch.set_dim((column_count, self.batch_count, self.tile_size))
+            self.batch_dot_launch.launch()
+        else:
+            # Non-batched path: tiled tree reduction
+            num_blocks = (a.shape[1] + self.tile_size - 1) // self.tile_size
 
-        for _r in range(self.rounds):
-            array_length = num_blocks
-            num_blocks = (array_length + self.tile_size - 1) // self.tile_size
-            data_in, data_out = data_out, data_in
+            self.dot_launch.set_param_at_index(0, a)
+            self.dot_launch.set_param_at_index(1, b)
+            self.dot_launch.set_param_at_index(2, data_out)
+            self.dot_launch.set_dim((column_count, num_blocks, self.tile_size))
+            self.dot_launch.launch()
 
-            self.sum_launch.set_param_at_index(0, data_in[:, :array_length])
-            self.sum_launch.set_param_at_index(1, data_out)
-            self.sum_launch.set_dim((column_count, num_blocks, self.tile_size))
-            self.sum_launch.launch()
+            for _r in range(self.rounds):
+                array_length = num_blocks
+                num_blocks = (array_length + self.tile_size - 1) // self.tile_size
+                data_in, data_out = data_out, data_in
+
+                self.sum_launch.set_param_at_index(0, data_in[:, :array_length])
+                self.sum_launch.set_param_at_index(1, data_out)
+                self.sum_launch.set_dim((column_count, num_blocks, self.tile_size))
+                self.sum_launch.launch()
 
         return data_out
 
-    def col(self, col: int = 0):
-        return self._output[col][:1]
+    def col(self, col: int = 0) -> wp.array:
+        """Return a view of the result for column ``col``, shape ``(batch_count,)``."""
+        return self._output[col][: self.batch_count]
 
-    def cols(self, count, start: int = 0):
-        return self._output[start : start + count, :1]
+    def cols(self, count: int, start: int = 0) -> wp.array:
+        """Return a view of results for columns ``[start, start+count)``, shape ``(count, batch_count)``."""
+        return self._output[start : start + count, : self.batch_count]
 
 
 @functools.cache
@@ -326,6 +417,34 @@ def _create_tiled_dot_kernels(tile_size):
         wp.tile_store(partial_sums[column], tile_sum, offset=block_id)
 
     return block_dot_kernel, block_sum_kernel
+
+
+@functools.cache
+def _create_batched_dot_kernel(tile_size):
+    @wp.kernel
+    def batch_dot_kernel(
+        a: wp.array2d(dtype=Any),
+        b: wp.array2d(dtype=Any),
+        result: wp.array2d(dtype=Any),
+        batch_offsets: wp.array1d(dtype=int),
+    ):
+        col, batch_id, lane = wp.tid()
+
+        batch_start = batch_offsets[batch_id]
+        batch_end = batch_offsets[batch_id + 1]
+
+        # Each lane strides over the subproblem range and accumulates its share
+        acc = a.dtype(0.0)
+        i = lane
+        while i < batch_end - batch_start:
+            acc = acc + a[col, batch_start + i] * b[col, batch_start + i]
+            i += tile_size
+
+        # Cooperative reduction across all lanes in this block
+        total = wp.tile_sum(wp.tile(acc))
+        wp.tile_store(result[col], total, offset=batch_id)
+
+    return batch_dot_kernel
 
 
 def cg(
@@ -376,18 +495,30 @@ def cg(
     A = aslinearoperator(A)
     M = aslinearoperator(M)
 
+    batch_count = A.batch_count
+    # Sentinel offsets for single-batch case enable the same kernel code path for both cases
+    batch_offsets = (
+        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
+    )
+
     if maxiter == 0:
-        maxiter = A.shape[0]
+        maxiter = A.shape[0] // batch_count
 
     device = A.device
     scalar_type = A.scalar_type
 
-    # Temp storage
+    # Temp storage — residuals are per-subproblem
     r_and_z = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
     p_and_Ap = wp.empty_like(r_and_z)
-    residuals = wp.empty(2, dtype=scalar_type, device=device)
+    residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
 
-    tiled_dot = TiledDot(max_length=A.shape[0], device=device, scalar_type=scalar_type, max_column_count=2)
+    tiled_dot = TiledDot(
+        max_length=A.shape[0],
+        device=device,
+        scalar_type=scalar_type,
+        max_column_count=2,
+        batch_offsets=A.batch_offsets,
+    )
 
     # named views
 
@@ -404,7 +535,7 @@ def cg(
     r_norm_sq = tiled_dot.col(0)
 
     p, Ap = p_and_Ap[0], p_and_Ap[1]
-    rz_old, atol_sq = residuals[0:1], residuals[1:2]
+    rz_old, atol_sq = residuals[0], residuals[1]
 
     # Not strictly necessary, but makes it more robust to user-provided LinearOperators
     Ap.zero_()
@@ -438,7 +569,7 @@ def cg(
             kernel=_cg_kernel_1,
             dim=x.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, rz_old, p_Ap, x, r, p, Ap],
+            inputs=[atol_sq, r_norm_sq, rz_old, p_Ap, x, r, p, Ap, batch_offsets],
         )
 
         update_rr_rz()
@@ -447,7 +578,7 @@ def cg(
             kernel=_cg_kernel_2,
             dim=z.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p],
+            inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p, batch_offsets],
         )
 
     return _run_capturable_loop(do_iteration, r_norm_sq, maxiter, atol_sq, callback, check_every, use_cuda_graph)
@@ -503,8 +634,13 @@ def cr(
     A = aslinearoperator(A)
     M = aslinearoperator(M)
 
+    batch_count = A.batch_count
+    batch_offsets = (
+        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
+    )
+
     if maxiter == 0:
-        maxiter = A.shape[0]
+        maxiter = A.shape[0] // batch_count
 
     device = A.device
     scalar_type = wp._src.types.type_scalar_type(A.dtype)
@@ -512,14 +648,20 @@ def cr(
     # Notations below follow roughly pseudo-code from https://en.wikipedia.org/wiki/Conjugate_residual_method
     # with z := M^-1 r and y := M^-1 Ap
 
-    # Temp storage
+    # Temp storage — residuals are per-subproblem
     r_and_z = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
     r_and_Az = wp.empty_like(r_and_z)
     y_and_Ap = wp.empty_like(r_and_z)
     p = wp.empty_like(b)
-    residuals = wp.empty(2, dtype=scalar_type, device=device)
+    residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
 
-    tiled_dot = TiledDot(max_length=A.shape[0], device=device, scalar_type=scalar_type, max_column_count=2)
+    tiled_dot = TiledDot(
+        max_length=A.shape[0],
+        device=device,
+        scalar_type=scalar_type,
+        max_column_count=2,
+        batch_offsets=A.batch_offsets,
+    )
 
     if M is None:
         r_and_z = _repeat_first(r_and_z)
@@ -533,7 +675,7 @@ def cr(
 
     r_norm_sq = tiled_dot.col(0)
     zAz_new = tiled_dot.col(1)
-    zAz_old, atol_sq = residuals[0:1], residuals[1:2]
+    zAz_old, atol_sq = residuals[0], residuals[1]
 
     # Initialize tolerance from right-hand-side norm
     _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
@@ -572,7 +714,7 @@ def cr(
                 kernel=_cg_kernel_1,
                 dim=x.shape[0],
                 device=device,
-                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, p, Ap],
+                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, p, Ap, batch_offsets],
             )
         else:
             # In preconditioned case, we have one more vector to update
@@ -580,7 +722,7 @@ def cr(
                 kernel=_cr_kernel_1,
                 dim=x.shape[0],
                 device=device,
-                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, z, p, Ap, y],
+                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, z, p, Ap, y, batch_offsets],
             )
 
         update_rr_zAz()
@@ -588,7 +730,7 @@ def cr(
             kernel=_cr_kernel_2,
             dim=z.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap],
+            inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap, batch_offsets],
         )
 
     return _run_capturable_loop(
@@ -652,15 +794,20 @@ def bicgstab(
     A = aslinearoperator(A)
     M = aslinearoperator(M)
 
+    batch_count = A.batch_count
+    batch_offsets = (
+        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
+    )
+
     if maxiter == 0:
-        maxiter = A.shape[0]
+        maxiter = A.shape[0] // batch_count
 
     device = A.device
     scalar_type = wp._src.types.type_scalar_type(A.dtype)
 
     # Notations below follow pseudo-code from biconjugate https://en.wikipedia.org/wiki/Biconjugate_gradient_stabilized_method
 
-    # Temp storage
+    # Temp storage — atol_sq is per-subproblem
     r_and_r0 = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
     p = wp.empty_like(b)
     v = wp.empty_like(b)
@@ -679,11 +826,17 @@ def bicgstab(
         z = r
         Mt = t
 
-    tiled_dot = TiledDot(max_length=A.shape[0], device=device, scalar_type=scalar_type, max_column_count=5)
+    tiled_dot = TiledDot(
+        max_length=A.shape[0],
+        device=device,
+        scalar_type=scalar_type,
+        max_column_count=5,
+        batch_offsets=A.batch_offsets,
+    )
     r_norm_sq = tiled_dot.col(0)
     rho = tiled_dot.col(1)
 
-    atol_sq = wp.empty(1, dtype=scalar_type, device=device)
+    atol_sq = wp.empty(batch_count, dtype=scalar_type, device=device)
 
     # Initialize tolerance from right-hand-side norm
     _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
@@ -717,7 +870,7 @@ def bicgstab(
             kernel=_bicgstab_kernel_1,
             dim=x.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, rho, r0v, x, r, y, v],
+            inputs=[atol_sq, r_norm_sq, rho, r0v, x, r, y, v, batch_offsets],
         )
         tiled_dot.compute(r, r, col_offset=0)
 
@@ -747,7 +900,7 @@ def bicgstab(
             kernel=_bicgstab_kernel_2,
             dim=z.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, st, tt, z, t, x, r],
+            inputs=[atol_sq, r_norm_sq, st, tt, z, t, x, r, batch_offsets],
         )
 
         # r = <r,r>, rho = <r0, r>
@@ -759,7 +912,7 @@ def bicgstab(
             kernel=_bicgstab_kernel_3,
             dim=z.shape[0],
             device=device,
-            inputs=[atol_sq, r_norm_sq, rho, r0v, st, tt, p, r, v],
+            inputs=[atol_sq, r_norm_sq, rho, r0v, st, tt, p, r, v, batch_offsets],
         )
 
     return _run_capturable_loop(
@@ -1019,6 +1172,20 @@ def _get_tolerances(dtype, tol, atol):
     return tol, atol
 
 
+@wp.func
+def _find_batch(dof: int, batch_offsets: wp.array(dtype=int)) -> int:
+    """Binary search for the batch containing ``dof`` in ``batch_offsets``."""
+    lo = int(0)
+    hi = batch_offsets.shape[0] - 2
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if batch_offsets[mid] <= dof:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 @wp.kernel
 def _initialize_tolerance(
     rtol: Any,
@@ -1026,8 +1193,9 @@ def _initialize_tolerance(
     r_norm_sq: wp.array(dtype=Any),
     atol_sq: wp.array(dtype=Any),
 ):
-    atol = wp.max(rtol * wp.sqrt(r_norm_sq[0]), atol)
-    atol_sq[0] = atol * atol
+    i = wp.tid()
+    a = wp.max(rtol * wp.sqrt(r_norm_sq[i]), atol)
+    atol_sq[i] = a * a
 
 
 def _initialize_absolute_tolerance(
@@ -1038,31 +1206,40 @@ def _initialize_absolute_tolerance(
     atol_sq: wp.array,
 ):
     scalar_type = atol_sq.dtype
+    batch_count = atol_sq.shape[0]
 
-    # Compute b norm to define absolute tolerance
+    # Compute per-subproblem b norm to define absolute tolerances
     tiled_dot.compute(b, b)
     b_norm_sq = tiled_dot.col(0)
 
     rtol, atol = _get_tolerances(scalar_type, tol, atol)
     wp.launch(
         kernel=_initialize_tolerance,
-        dim=1,
+        dim=batch_count,
         device=b.device,
         inputs=[scalar_type(rtol), scalar_type(atol), b_norm_sq, atol_sq],
     )
 
 
-@wp.kernel
-def _update_condition(
-    maxiter: int,
-    cycle_size: int,
-    cur_iter: wp.array(dtype=int),
-    r_norm_sq: wp.array(dtype=Any),
-    atol_sq: wp.array(dtype=Any),
-    condition: wp.array(dtype=int),
-):
-    cur_iter[0] += cycle_size
-    condition[0] = wp.where(r_norm_sq[0] <= atol_sq[0] or cur_iter[0] >= maxiter, 0, 1)
+@functools.cache
+def _create_update_condition_kernel(batch_count: int):
+    @wp.kernel(module="unique")
+    def _update_condition(
+        maxiter: int,
+        cycle_size: int,
+        cur_iter: wp.array(dtype=int),
+        r_norm_sq: wp.array(dtype=Any),
+        atol_sq: wp.array(dtype=Any),
+        condition: wp.array(dtype=int),
+    ):
+        cur_iter[0] += cycle_size
+        all_converged = True
+        for i in range(batch_count):
+            if r_norm_sq[i] > atol_sq[i]:
+                all_converged = False
+        condition[0] = wp.where(all_converged or cur_iter[0] >= maxiter, 0, 1)
+
+    return _update_condition
 
 
 def _run_capturable_loop(
@@ -1076,9 +1253,10 @@ def _run_capturable_loop(
     cycle_size: int = 1,
 ):
     device = atol_sq.device
+    batch_count = atol_sq.shape[0]
 
     if check_every > 0:
-        atol = math.sqrt(atol_sq.numpy()[0])
+        atol = math.sqrt(float(atol_sq.numpy().max()))
         return _run_solver_loop(
             do_cycle, cycle_size, r_norm_sq, maxiter, atol, callback, check_every, use_cuda_graph, device
         )
@@ -1087,8 +1265,9 @@ def _run_capturable_loop(
     cur_iter = cur_iter_and_condition[0:1]
     condition = cur_iter_and_condition[1:2]
 
+    update_condition_kernel = _create_update_condition_kernel(batch_count)
     update_condition_launch = wp.launch(
-        _update_condition,
+        update_condition_kernel,
         dim=1,
         device=device,
         inputs=[int(maxiter), cycle_size, cur_iter, r_norm_sq, atol_sq, condition],
@@ -1116,7 +1295,7 @@ def _run_capturable_loop(
         if device.is_capturing:
             wp.capture_while(condition, do_cycle_with_condition)
         else:
-            with wp.ScopedCapture() as capture:
+            with wp.ScopedCapture(device=device) as capture:
                 wp.capture_while(condition, do_cycle_with_condition)
             wp.capture_launch(capture.graph)
     else:
@@ -1142,7 +1321,8 @@ def _run_solver_loop(
 
     cur_iter = 0
 
-    err_sq = r_norm_sq.numpy()[0]
+    # For batched solves r_norm_sq has shape (batch_count,); convergence uses the worst batch.
+    err_sq = float(r_norm_sq.numpy().max())
     err = math.sqrt(err_sq)
     if callback is not None:
         callback(cur_iter, err, atol)
@@ -1156,7 +1336,7 @@ def _run_solver_loop(
         # Do not do graph capture at first iteration -- modules may not be loaded yet
         if device.is_cuda and use_cuda_graph and cur_iter > 0:
             if graph is None:
-                with wp.ScopedCapture(force_module_load=False) as capture:
+                with wp.ScopedCapture(device=device, force_module_load=False) as capture:
                     do_cycle()
                 graph = capture.graph
             wp.capture_launch(graph)
@@ -1169,7 +1349,7 @@ def _run_solver_loop(
             break
 
         if (cur_iter % check_every) < cycle_size:
-            err_sq = r_norm_sq.numpy()[0]
+            err_sq = float(r_norm_sq.numpy().max())
 
             if err_sq <= atol_sq:
                 break
@@ -1177,7 +1357,7 @@ def _run_solver_loop(
             if callback is not None:
                 callback(cur_iter, math.sqrt(err_sq), atol)
 
-    err_sq = r_norm_sq.numpy()[0]
+    err_sq = float(r_norm_sq.numpy().max())
     err = math.sqrt(err_sq)
     if callback is not None:
         callback(cur_iter, err, atol)
@@ -1281,10 +1461,12 @@ def _cg_kernel_1(
     r: wp.array(dtype=Any),
     p: wp.array(dtype=Any),
     Ap: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    alpha = wp.where(resid[0] > tol[0], rz_old[0] / p_Ap[0], rz_old.dtype(0.0))
+    alpha = wp.where(resid[bid] > tol[bid], rz_old[bid] / p_Ap[bid], rz_old.dtype(0.0))
 
     x[i] = x[i] + alpha * p[i]
     r[i] = r[i] - alpha * Ap[i]
@@ -1298,12 +1480,13 @@ def _cg_kernel_2(
     rz_new: wp.array(dtype=Any),
     z: wp.array(dtype=Any),
     p: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     #    p = r + (rz_new / rz_old) * p;
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    cond = resid_new[0] > tol[0]
-    beta = wp.where(cond, rz_new[0] / rz_old[0], rz_old.dtype(0.0))
+    beta = wp.where(resid_new[bid] > tol[bid], rz_new[bid] / rz_old[bid], rz_old.dtype(0.0))
 
     p[i] = z[i] + beta * p[i]
 
@@ -1320,10 +1503,12 @@ def _cr_kernel_1(
     p: wp.array(dtype=Any),
     Ap: wp.array(dtype=Any),
     y: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    alpha = wp.where(resid[0] > tol[0] and y_Ap[0] > 0.0, zAz_old[0] / y_Ap[0], zAz_old.dtype(0.0))
+    alpha = wp.where(resid[bid] > tol[bid] and y_Ap[bid] > 0.0, zAz_old[bid] / y_Ap[bid], zAz_old.dtype(0.0))
 
     x[i] = x[i] + alpha * p[i]
     r[i] = r[i] - alpha * Ap[i]
@@ -1340,11 +1525,13 @@ def _cr_kernel_2(
     p: wp.array(dtype=Any),
     Az: wp.array(dtype=Any),
     Ap: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     #    p = r + (rz_new / rz_old) * p;
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    beta = wp.where(resid[0] > tol[0] and zAz_old[0] > 0.0, zAz_new[0] / zAz_old[0], zAz_old.dtype(0.0))
+    beta = wp.where(resid[bid] > tol[bid] and zAz_old[bid] > 0.0, zAz_new[bid] / zAz_old[bid], zAz_old.dtype(0.0))
 
     p[i] = z[i] + beta * p[i]
     Ap[i] = Az[i] + beta * Ap[i]
@@ -1360,10 +1547,12 @@ def _bicgstab_kernel_1(
     r: wp.array(dtype=Any),
     y: wp.array(dtype=Any),
     v: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    alpha = wp.where(resid[0] > tol[0], rho_old[0] / r0v[0], rho_old.dtype(0.0))
+    alpha = wp.where(resid[bid] > tol[bid], rho_old[bid] / r0v[bid], rho_old.dtype(0.0))
 
     x[i] += alpha * y[i]
     r[i] -= alpha * v[i]
@@ -1379,10 +1568,12 @@ def _bicgstab_kernel_2(
     t: wp.array(dtype=Any),
     x: wp.array(dtype=Any),
     r: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    omega = wp.where(resid[0] > tol[0], st[0] / tt[0], st.dtype(0.0))
+    omega = wp.where(resid[bid] > tol[bid], st[bid] / tt[bid], st.dtype(0.0))
 
     x[i] += omega * z[i]
     r[i] -= omega * t[i]
@@ -1399,11 +1590,13 @@ def _bicgstab_kernel_3(
     p: wp.array(dtype=Any),
     r: wp.array(dtype=Any),
     v: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     i = wp.tid()
+    bid = _find_batch(i, batch_offsets)
 
-    beta = wp.where(resid[0] > tol[0], rho_new[0] * tt[0] / (r0v[0] * st[0]), st.dtype(0.0))
-    beta_omega = wp.where(resid[0] > tol[0], rho_new[0] / r0v[0], st.dtype(0.0))
+    beta = wp.where(resid[bid] > tol[bid], rho_new[bid] * tt[bid] / (r0v[bid] * st[bid]), st.dtype(0.0))
+    beta_omega = wp.where(resid[bid] > tol[bid], rho_new[bid] / r0v[bid], st.dtype(0.0))
 
     p[i] = r[i] + beta * p[i] - beta_omega * v[i]
 
