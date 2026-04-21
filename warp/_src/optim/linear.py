@@ -246,9 +246,6 @@ class TiledDot:
         batch_offsets: Optional array of shape ``(B+1,)`` partitioning the array into ``B``
             independent subproblems. When provided, :meth:`compute` returns ``B`` independent
             dot products rather than a single global one.
-        max_batch_len: Optional hint for the maximum subproblem length. Has no effect on
-            memory allocation; only used to compute the number of tree-reduction rounds
-            in the non-batched path if applicable.
     """
 
     def __init__(
@@ -259,7 +256,6 @@ class TiledDot:
         device=None,
         max_column_count: int = 1,
         batch_offsets: wp.array | None = None,
-        max_batch_len: int | None = None,
     ):
         self.tile_size = tile_size
         self.device = device
@@ -267,24 +263,23 @@ class TiledDot:
         self.batch_offsets = batch_offsets
         self.batch_count = 1 if batch_offsets is None else batch_offsets.shape[0] - 1
 
-        num_blocks = (max_length + self.tile_size - 1) // self.tile_size
-        # Scratch must hold at least batch_count result slots per column (one per subproblem)
-        scratch_size = max(num_blocks, self.batch_count)
-        scratch = wp.empty(
-            shape=(2, max_column_count, scratch_size),
-            dtype=scalar_type,
-            device=self.device,
-        )
-        self.partial_sums_a = scratch[0]
-        self.partial_sums_b = scratch[1]
+        if self.batch_count == 1:
+            num_blocks = (max_length + self.tile_size - 1) // self.tile_size
+            # Scratch must hold at least batch_count result slots per column (one per subproblem)
+            scratch_size = max(num_blocks, self.batch_count)
+            scratch = wp.zeros(
+                shape=(2, max_column_count, scratch_size),
+                dtype=scalar_type,
+                device=self.device,
+            )
+            self.partial_sums_a = scratch[0]
+            self.partial_sums_b = scratch[1]
 
-        if batch_offsets is None:
-            # Non-batched: tiled tree reduction (unchanged from original)
+            # Non-batched: tiled tree reduction
             self.dot_kernel, self.sum_kernel = _create_tiled_dot_kernels(self.tile_size)
 
-            effective_len = max_batch_len if max_batch_len is not None else max_length
             rounds = 0
-            length = (effective_len + self.tile_size - 1) // self.tile_size
+            length = (max_length + self.tile_size - 1) // self.tile_size
             while length > 1:
                 length = (length + self.tile_size - 1) // self.tile_size
                 rounds += 1
@@ -310,18 +305,29 @@ class TiledDot:
             )
             self.batch_dot_launch = None
         else:
-            # Batched: direct per-subproblem reduction in one kernel, no tree rounds needed.
+            # Batched: direct per-subproblem reduction in one kernel
             # Each subproblem's threads loop over their DOF range and reduce cooperatively.
+            # (Assumes all subproblems are small compared to total length)
+
+            if not self.device.is_cuda:
+                self.tile_size = 1
+
+            self.partial_sums_a = wp.zeros(
+                shape=(max_column_count, self.batch_count),
+                dtype=scalar_type,
+                device=self.device,
+            )
+            self.partial_sums_b = self.partial_sums_a
+
             self.rounds = 0
-            self._output = self.partial_sums_a  # rounds=0 → always written to partial_sums_a
+            self._output = self.partial_sums_a  # rounds=0 -> always written to partial_sums_a
             self.dot_launch = None
             self.sum_launch = None
 
-            batch_dot_kernel = _create_batched_dot_kernel(self.tile_size)
             self.batch_dot_launch: wp.Launch = wp.launch(
                 batch_dot_kernel,
                 dim=(max_column_count, self.batch_count, self.tile_size),
-                inputs=[self.partial_sums_a, self.partial_sums_a, self.partial_sums_a, batch_offsets],
+                inputs=[self.partial_sums_a, self.partial_sums_b, self.partial_sums_a, batch_offsets],
                 block_dim=self.tile_size,
                 device=self.device,
                 record_cmd=True,
@@ -386,7 +392,7 @@ class TiledDot:
 
 @functools.cache
 def _create_tiled_dot_kernels(tile_size):
-    @wp.kernel
+    @wp.kernel(module="unique")
     def block_dot_kernel(
         a: wp.array2d(dtype=Any),
         b: wp.array2d(dtype=Any),
@@ -403,7 +409,7 @@ def _create_tiled_dot_kernels(tile_size):
         tile_sum = wp.tile_sum(t)
         wp.tile_store(partial_sums[column], tile_sum, offset=block_id)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def block_sum_kernel(
         data: wp.array2d(dtype=Any),
         partial_sums: wp.array2d(dtype=Any),
@@ -419,32 +425,26 @@ def _create_tiled_dot_kernels(tile_size):
     return block_dot_kernel, block_sum_kernel
 
 
-@functools.cache
-def _create_batched_dot_kernel(tile_size):
-    @wp.kernel
-    def batch_dot_kernel(
-        a: wp.array2d(dtype=Any),
-        b: wp.array2d(dtype=Any),
-        result: wp.array2d(dtype=Any),
-        batch_offsets: wp.array1d(dtype=int),
-    ):
-        col, batch_id, lane = wp.tid()
+@wp.kernel(module="unique")
+def batch_dot_kernel(
+    a: wp.array2d(dtype=Any),
+    b: wp.array2d(dtype=Any),
+    result: wp.array2d(dtype=Any),
+    batch_offsets: wp.array1d(dtype=int),
+):
+    col, batch_id, lane = wp.tid()
 
-        batch_start = batch_offsets[batch_id]
-        batch_end = batch_offsets[batch_id + 1]
+    batch_start = batch_offsets[batch_id] + lane
+    batch_end = batch_offsets[batch_id + 1]
 
-        # Each lane strides over the subproblem range and accumulates its share
-        acc = a.dtype(0.0)
-        i = lane
-        while i < batch_end - batch_start:
-            acc = acc + a[col, batch_start + i] * b[col, batch_start + i]
-            i += tile_size
+    # Each lane strides over the subproblem range and accumulates its share
+    acc = a.dtype(0.0)
+    for i in range(batch_start, batch_end, wp.block_dim()):
+        acc += a[col, i] * b[col, i]
 
-        # Cooperative reduction across all lanes in this block
-        total = wp.tile_sum(wp.tile(acc))
-        wp.tile_store(result[col], total, offset=batch_id)
-
-    return batch_dot_kernel
+    # Cooperative reduction across all lanes in this block
+    total = wp.tile_sum(wp.tile(acc))
+    wp.tile_store(result[col], total, offset=batch_id)
 
 
 def cg(
@@ -1175,15 +1175,12 @@ def _get_tolerances(dtype, tol, atol):
 @wp.func
 def _find_batch(dof: int, batch_offsets: wp.array(dtype=int)) -> int:
     """Binary search for the batch containing ``dof`` in ``batch_offsets``."""
-    lo = int(0)
-    hi = batch_offsets.shape[0] - 2
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if batch_offsets[mid] <= dof:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+
+    if not batch_offsets:
+        return 0
+
+    batch_count = batch_offsets.shape[0] - 1
+    return wp.where(dof < batch_offsets[batch_count], wp.lower_bound(batch_offsets, 0, batch_count + 1, dof + 1), 0) - 1
 
 
 @wp.kernel
@@ -1365,7 +1362,7 @@ def _run_solver_loop(
     return cur_iter, err, atol
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _dense_mv_kernel(
     A: wp.array2d(dtype=Any),
     x: wp.array1d(dtype=Any),
@@ -1390,7 +1387,7 @@ def _dense_mv_kernel(
     wp.tile_store(z, row_tile, offset=row)
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _diag_mv_kernel(
     A: wp.array(dtype=Any),
     x: wp.array(dtype=Any),
@@ -1416,7 +1413,7 @@ def _inverse_diag_coefficient(coeff: Any, use_abs: wp.bool):
     return wp.where(coeff == zero, one, one / wp.where(use_abs, wp.abs(coeff), coeff))
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _extract_inverse_diagonal_blocked(
     diag_block: wp.array(dtype=Any),
     inv_diag: wp.array(dtype=Any),
@@ -1431,7 +1428,7 @@ def _extract_inverse_diagonal_blocked(
     inv_diag[i] = d
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _extract_inverse_diagonal_scalar(
     diag_array: wp.array(dtype=Any),
     inv_diag: wp.array(dtype=Any),
@@ -1441,7 +1438,7 @@ def _extract_inverse_diagonal_scalar(
     inv_diag[i] = _inverse_diag_coefficient(diag_array[i], use_abs != 0)
 
 
-@wp.kernel
+@wp.kernel(module="unique")
 def _extract_inverse_diagonal_dense(
     dense_matrix: wp.array2d(dtype=Any),
     inv_diag: wp.array(dtype=Any),
@@ -1784,3 +1781,32 @@ def _gmres_update_x_kernel(k: int, beta: Any, y: wp.array(dtype=Any), V: wp.arra
         xi += V[j, tid] * y[j]
 
     x[tid] = xi
+
+
+def _register_overloads():
+    # Pre-register float32 and float64 overloads so the module can be AOT-compiled
+    # without requiring a prior runtime launch.
+    for dtype in (wp.float32, wp.float64):
+        a = wp.array(dtype=dtype)
+        a2 = wp.array2d(dtype=dtype)
+
+        wp.overload(_initialize_tolerance, [dtype, dtype, a, a])
+        wp.overload(_cg_kernel_1, {"tol": a, "resid": a, "rz_old": a, "p_Ap": a, "x": a, "r": a, "p": a, "Ap": a})
+        wp.overload(_cg_kernel_2, {"tol": a, "resid_new": a, "rz_old": a, "rz_new": a, "z": a, "p": a})
+        wp.overload(
+            _cr_kernel_1,
+            {"tol": a, "resid": a, "zAz_old": a, "y_Ap": a, "x": a, "r": a, "z": a, "p": a, "Ap": a, "y": a},
+        )
+        wp.overload(_cr_kernel_2, {"tol": a, "resid": a, "zAz_old": a, "zAz_new": a, "z": a, "p": a, "Az": a, "Ap": a})
+        wp.overload(_bicgstab_kernel_1, {"tol": a, "resid": a, "rho_old": a, "r0v": a, "x": a, "r": a, "y": a, "v": a})
+        wp.overload(_bicgstab_kernel_2, {"tol": a, "resid": a, "st": a, "tt": a, "z": a, "t": a, "x": a, "r": a})
+        wp.overload(
+            _bicgstab_kernel_3, {"tol": a, "resid": a, "rho_new": a, "r0v": a, "st": a, "tt": a, "p": a, "r": a, "v": a}
+        )
+        wp.overload(_gmres_solve_least_squares, {"beta": a, "H": a2, "y": a})
+        wp.overload(_gmres_arnoldi_axpy_kernel, [a2, a, a2])
+        wp.overload(_gmres_arnoldi_normalize_kernel, [a, a, a, a])
+        wp.overload(_gmres_update_x_kernel, {"beta": dtype, "y": a, "V": a2, "x": a})
+
+
+_register_overloads()
