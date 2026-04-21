@@ -73,6 +73,10 @@
   and loaded for execution from Python or standalone C++ via `capture_load()`. CPU graph
   capture supports replay through `capture_launch()`. Added `wp.handle` scalar type for mesh handle serialization
   ([GH-1349](https://github.com/NVIDIA/warp/issues/1349)).
+- Add pre-allocated functors for `warp.optim.linear` solvers. Passing `run=False` to `cg`, `cr`, `bicgstab`, or `gmres`
+  returns a `CG`, `CR`, `BiCGSTAB`, or `GMRES` state object (subclass of the new `LinearSolverState` base class) that
+  holds all temporary buffers and can be invoked repeatedly on compatible systems (same shape, batch count, dtype,
+  and device), avoiding per-call allocation overhead.
 
 ### Removed
 

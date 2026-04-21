@@ -12,7 +12,20 @@ from warp._src.types import type_is_matrix, type_is_vector, type_length, type_sc
 
 _wp_module_name_ = "warp.optim.linear"
 
-__all__ = ["LinearOperator", "aslinearoperator", "bicgstab", "cg", "cr", "gmres", "preconditioner"]
+__all__ = [
+    "CG",
+    "CR",
+    "GMRES",
+    "BiCGSTAB",
+    "LinearOperator",
+    "LinearSolverState",
+    "aslinearoperator",
+    "bicgstab",
+    "cg",
+    "cr",
+    "gmres",
+    "preconditioner",
+]
 
 # No need to auto-generate adjoint code for linear solvers
 wp.set_module_options({"enable_backward": False})
@@ -447,6 +460,238 @@ def batch_dot_kernel(
     wp.tile_store(result[col], total, offset=batch_id)
 
 
+class LinearSolverState:
+    """Pre-allocated state for a linear iterative solver.
+
+    Holds all temporary buffers required by the solver plus a reference to the original
+    system (``A``, ``b``, ``x``, optional ``M``). Calling the state runs the solver,
+    optionally substituting a new compatible matrix, right-hand-side, solution vector,
+    or preconditioner. This avoids repeated buffer allocation when the same solver is
+    applied many times to systems that share the same shape, batch count, dtype, and
+    device.
+
+    Args:
+        A: the linear system's left-hand-side
+        b: the linear system's right-hand-side
+        x: initial guess and solution vector
+        tol: relative tolerance for the residual, as a ratio of the right-hand-side norm
+        atol: absolute tolerance for the residual
+        maxiter: maximum number of iterations to perform before aborting. Defaults to the system size.
+        M: optional preconditioner.
+        callback: function to be called every ``check_every`` iteration with the current iteration number, residual and tolerance.
+        check_every: number of iterations every which to call ``callback`` and check the residual against the tolerance.
+        use_cuda_graph: whether to capture the solver iteration as a CUDA graph for reduced launch overhead.
+
+    Instances are not directly constructible — use the solver-specific subclasses
+    :class:`CG`, :class:`CR`, :class:`BiCGSTAB`, and :class:`GMRES`, or obtain one by
+    calling the corresponding solver function (:func:`cg`, :func:`cr`, :func:`bicgstab`,
+    :func:`gmres`) with ``run=False``.
+    """
+
+    def __init__(
+        self,
+        A: _Matrix,
+        b: wp.array,
+        x: wp.array,
+        tol: float | None = None,
+        atol: float | None = None,
+        maxiter: float | None = 0,
+        M: _Matrix | None = None,
+        callback: Callable | None = None,
+        check_every: int = 10,
+        use_cuda_graph: bool = True,
+    ):
+        self._A = aslinearoperator(A)
+        self._M = aslinearoperator(M)
+        self._b = b
+        self._x = x
+        self._tol = tol
+        self._atol = atol
+        self._callback = callback
+        self._check_every = check_every
+        self._use_cuda_graph = use_cuda_graph
+
+        self._device = self._A.device
+        self._scalar_type = self._A.scalar_type
+        self._batch_count = self._A.batch_count
+        # Sentinel offsets for single-batch case enable the same kernel code path for both cases
+        self._batch_offsets = (
+            self._A.batch_offsets
+            if self._A.batch_offsets is not None
+            else wp.array([0, self._A.shape[0]], dtype=int, device=self._device)
+        )
+
+        if maxiter is None or maxiter == 0:
+            maxiter = self._A.shape[0] // self._batch_count
+        self._maxiter = int(maxiter)
+
+        self._allocate()
+
+    def _allocate(self):
+        """Allocate solver-specific temporary buffers. Implemented by subclasses."""
+        raise NotImplementedError
+
+    def _run(self, A: "LinearOperator", b: wp.array, x: wp.array, M: "LinearOperator | None"):
+        """Run one solve with the given (possibly substituted) operands. Implemented by subclasses."""
+        raise NotImplementedError
+
+    def _check_compatible(self, A: "LinearOperator", b: wp.array, x: wp.array, M: "LinearOperator | None"):
+        """Validate that ``A``, ``b``, ``x``, ``M`` are compatible with the allocated state."""
+        if A is not self._A:
+            if A.shape != self._A.shape:
+                raise ValueError(f"Incompatible A.shape: expected {self._A.shape}, got {A.shape}")
+            if A.dtype != self._A.dtype:
+                raise ValueError(f"Incompatible A.dtype: expected {self._A.dtype}, got {A.dtype}")
+            if A.device != self._A.device:
+                raise ValueError(f"Incompatible A.device: expected {self._A.device}, got {A.device}")
+            if A.batch_count != self._A.batch_count:
+                raise ValueError(f"Incompatible A.batch_count: expected {self._A.batch_count}, got {A.batch_count}")
+            if self._A.batch_offsets is not None and A.batch_offsets is not self._A.batch_offsets:
+                raise ValueError("For batched systems, A.batch_offsets must be the same array as at construction")
+        if b is not self._b:
+            if b.shape != self._b.shape:
+                raise ValueError(f"Incompatible b.shape: expected {self._b.shape}, got {b.shape}")
+            if b.dtype != self._b.dtype:
+                raise ValueError(f"Incompatible b.dtype: expected {self._b.dtype}, got {b.dtype}")
+        if x is not self._x:
+            if x.shape != self._x.shape:
+                raise ValueError(f"Incompatible x.shape: expected {self._x.shape}, got {x.shape}")
+            if x.dtype != self._x.dtype:
+                raise ValueError(f"Incompatible x.dtype: expected {self._x.dtype}, got {x.dtype}")
+        if M is not None and self._M is not None and M is not self._M:
+            if M.shape != self._M.shape:
+                raise ValueError(f"Incompatible M.shape: expected {self._M.shape}, got {M.shape}")
+            if M.dtype != self._M.dtype:
+                raise ValueError(f"Incompatible M.dtype: expected {self._M.dtype}, got {M.dtype}")
+
+    def __call__(
+        self,
+        A: _Matrix | None = None,
+        b: wp.array | None = None,
+        x: wp.array | None = None,
+        M: _Matrix | None = None,
+    ):
+        """Run the solver, optionally substituting a new compatible matrix, right-hand-side,
+        solution vector, or preconditioner. Any argument left as ``None`` uses the value that
+        was passed at construction."""
+        A_op = aslinearoperator(A) if A is not None else self._A
+        M_op = aslinearoperator(M) if M is not None else self._M
+        b_arr = b if b is not None else self._b
+        x_arr = x if x is not None else self._x
+
+        self._check_compatible(A_op, b_arr, x_arr, M_op)
+        return self._run(A_op, b_arr, x_arr, M_op)
+
+
+class CG(LinearSolverState):
+    """Pre-allocated state for the Conjugate Gradient solver.
+
+    See :class:`LinearSolverState` for the constructor parameters. The preconditioner
+    ``M`` may be freely changed (or toggled between ``None`` and a valid operator)
+    between calls as long as the matrix shape, batch count, dtype, and device remain
+    the same.
+    """
+
+    def _allocate(self):
+        A = self._A
+        b = self._b
+        device = self._device
+        scalar_type = self._scalar_type
+        batch_count = self._batch_count
+
+        # Temp storage — residuals are per-subproblem
+        self._r_and_z_buf = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
+        self._p_and_Ap = wp.empty_like(self._r_and_z_buf)
+        self._residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
+
+        self._tiled_dot = TiledDot(
+            max_length=A.shape[0],
+            device=device,
+            scalar_type=scalar_type,
+            max_column_count=2,
+            batch_offsets=A.batch_offsets,
+        )
+
+        # (r, r) view — so we can compute r.z and r.r at once
+        self._r_repeated = _repeat_first(self._r_and_z_buf)
+
+    def _run(self, A, b, x, M):
+        device = self._device
+        batch_offsets = self._batch_offsets
+        tiled_dot = self._tiled_dot
+        p_and_Ap = self._p_and_Ap
+        r_and_z_buf = self._r_and_z_buf
+        r_repeated = self._r_repeated
+
+        if M is None:
+            # without preconditioner r == z
+            r_and_z = r_repeated
+            rz_new = tiled_dot.col(0)
+        else:
+            r_and_z = r_and_z_buf
+            rz_new = tiled_dot.col(1)
+
+        r, z = r_and_z[0], r_and_z[1]
+        r_norm_sq = tiled_dot.col(0)
+
+        p, Ap = p_and_Ap[0], p_and_Ap[1]
+        rz_old, atol_sq = self._residuals[0], self._residuals[1]
+
+        # Not strictly necessary, but makes it more robust to user-provided LinearOperators
+        Ap.zero_()
+        z.zero_()
+
+        # Initialize tolerance from right-hand-side norm
+        _initialize_absolute_tolerance(b, self._tol, self._atol, tiled_dot, atol_sq)
+        # Initialize residual
+        A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+
+        def update_rr_rz():
+            # z = M r
+            if M is None:
+                tiled_dot.compute(r, r)
+            else:
+                M.matvec(r, z, z, alpha=1.0, beta=0.0)
+                tiled_dot.compute(r_repeated, r_and_z_buf)
+
+        update_rr_rz()
+        p.assign(z)
+
+        def do_iteration():
+            rz_old.assign(rz_new)
+
+            # Ap = A * p;
+            A.matvec(p, Ap, Ap, alpha=1, beta=0)
+            tiled_dot.compute(p, Ap, col_offset=1)
+            p_Ap = tiled_dot.col(1)
+
+            wp.launch(
+                kernel=_cg_kernel_1,
+                dim=x.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, rz_old, p_Ap, x, r, p, Ap, batch_offsets],
+            )
+
+            update_rr_rz()
+
+            wp.launch(
+                kernel=_cg_kernel_2,
+                dim=z.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p, batch_offsets],
+            )
+
+        return _run_capturable_loop(
+            do_iteration,
+            r_norm_sq,
+            self._maxiter,
+            atol_sq,
+            self._callback,
+            self._check_every,
+            self._use_cuda_graph,
+        )
+
+
 def cg(
     A: _Matrix,
     b: wp.array,
@@ -458,7 +703,8 @@ def cg(
     callback: Callable | None = None,
     check_every=10,
     use_cuda_graph=True,
-) -> tuple[int, float, float] | tuple[wp.array, wp.array, wp.array]:
+    run: bool = True,
+) -> tuple[int, float, float] | tuple[wp.array, wp.array, wp.array] | CG:
     """Compute an approximate solution to a symmetric, positive-definite linear system
     using the Conjugate Gradient algorithm.
 
@@ -478,110 +724,167 @@ def cg(
             to the maximum number of iterations.
         use_cuda_graph: If true and when run on a CUDA device, capture the solver iteration as a CUDA graph for reduced launch overhead.
             The linear operator and preconditioner must only perform graph-friendly operations.
+        run: If ``True`` (default), allocate temporary buffers and immediately run the solver, returning the iteration count,
+            residual norm, and absolute tolerance. If ``False``, return a pre-allocated :class:`CG` functor that can be
+            called repeatedly on compatible systems (same shape, batch count, dtype, device) without re-allocating.
 
     Returns:
-        If `check_every` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
+        If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
             - residual_norm: The final residual norm ||b - Ax||
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
-        If `check_every` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
+        If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
             - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
+        If ``run`` is ``False``: a :class:`CG` functor with all temporary buffers pre-allocated.
+
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
-    A = aslinearoperator(A)
-    M = aslinearoperator(M)
-
-    batch_count = A.batch_count
-    # Sentinel offsets for single-batch case enable the same kernel code path for both cases
-    batch_offsets = (
-        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
+    state = CG(
+        A,
+        b,
+        x,
+        tol=tol,
+        atol=atol,
+        maxiter=maxiter,
+        M=M,
+        callback=callback,
+        check_every=check_every,
+        use_cuda_graph=use_cuda_graph,
     )
+    if run:
+        return state()
+    return state
 
-    if maxiter == 0:
-        maxiter = A.shape[0] // batch_count
 
-    device = A.device
-    scalar_type = A.scalar_type
+class CR(LinearSolverState):
+    """Pre-allocated state for the Conjugate Residual solver.
 
-    # Temp storage — residuals are per-subproblem
-    r_and_z = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
-    p_and_Ap = wp.empty_like(r_and_z)
-    residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
+    See :class:`LinearSolverState` for the constructor parameters. The preconditioner
+    ``M`` may be freely changed (or toggled between ``None`` and a valid operator)
+    between calls as long as the matrix shape, batch count, dtype, and device remain
+    the same.
+    """
 
-    tiled_dot = TiledDot(
-        max_length=A.shape[0],
-        device=device,
-        scalar_type=scalar_type,
-        max_column_count=2,
-        batch_offsets=A.batch_offsets,
-    )
+    def _allocate(self):
+        A = self._A
+        b = self._b
+        device = self._device
+        scalar_type = self._scalar_type
+        batch_count = self._batch_count
 
-    # named views
+        # Notations follow pseudo-code from https://en.wikipedia.org/wiki/Conjugate_residual_method
+        # with z := M^-1 r and y := M^-1 Ap
+        self._r_and_z_buf = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
+        self._r_and_Az = wp.empty_like(self._r_and_z_buf)
+        self._y_and_Ap_buf = wp.empty_like(self._r_and_z_buf)
+        self._p = wp.empty_like(b)
+        self._residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
 
-    # (r, r) -- so we can compute r.z and r.r at once
-    r_repeated = _repeat_first(r_and_z)
-    if M is None:
-        # without preconditioner r == z
-        r_and_z = r_repeated
-        rz_new = tiled_dot.col(0)
-    else:
-        rz_new = tiled_dot.col(1)
+        self._tiled_dot = TiledDot(
+            max_length=A.shape[0],
+            device=device,
+            scalar_type=scalar_type,
+            max_column_count=2,
+            batch_offsets=A.batch_offsets,
+        )
 
-    r, z = r_and_z[0], r_and_z[1]
-    r_norm_sq = tiled_dot.col(0)
+        self._r_and_z_repeated = _repeat_first(self._r_and_z_buf)
+        self._y_and_Ap_repeated = _repeat_first(self._y_and_Ap_buf)
 
-    p, Ap = p_and_Ap[0], p_and_Ap[1]
-    rz_old, atol_sq = residuals[0], residuals[1]
+    def _run(self, A, b, x, M):
+        device = self._device
+        batch_offsets = self._batch_offsets
+        tiled_dot = self._tiled_dot
+        r_and_z_buf = self._r_and_z_buf
+        y_and_Ap_buf = self._y_and_Ap_buf
+        r_and_Az = self._r_and_Az
+        p = self._p
 
-    # Not strictly necessary, but makes it more robust to user-provided LinearOperators
-    Ap.zero_()
-    z.zero_()
-
-    # Initialize tolerance from right-hand-side norm
-    _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
-    # Initialize residual
-    A.matvec(x, b, r, alpha=-1.0, beta=1.0)
-
-    def update_rr_rz():
-        # z = M r
         if M is None:
-            tiled_dot.compute(r, r)
+            r_and_z = self._r_and_z_repeated
+            y_and_Ap = self._y_and_Ap_repeated
         else:
+            r_and_z = r_and_z_buf
+            y_and_Ap = y_and_Ap_buf
+
+        r, z = r_and_z[0], r_and_z[1]
+        r_copy, Az = r_and_Az[0], r_and_Az[1]
+        y, Ap = y_and_Ap[0], y_and_Ap[1]
+
+        r_norm_sq = tiled_dot.col(0)
+        zAz_new = tiled_dot.col(1)
+        zAz_old, atol_sq = self._residuals[0], self._residuals[1]
+
+        # Initialize tolerance from right-hand-side norm
+        _initialize_absolute_tolerance(b, self._tol, self._atol, tiled_dot, atol_sq)
+        # Initialize residual
+        A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+
+        # Not strictly necessary, but makes it more robust to user-provided LinearOperators
+        y_and_Ap_buf.zero_()
+
+        # z = M r
+        if M is not None:
+            z.zero_()
             M.matvec(r, z, z, alpha=1.0, beta=0.0)
-            tiled_dot.compute(r_repeated, r_and_z)
 
-    update_rr_rz()
-    p.assign(z)
+        def update_rr_zAz():
+            A.matvec(z, Az, Az, alpha=1, beta=0)
+            r_copy.assign(r)
+            tiled_dot.compute(r_and_z, r_and_Az)
 
-    def do_iteration():
-        rz_old.assign(rz_new)
+        update_rr_zAz()
 
-        # Ap = A * p;
-        A.matvec(p, Ap, Ap, alpha=1, beta=0)
-        tiled_dot.compute(p, Ap, col_offset=1)
-        p_Ap = tiled_dot.col(1)
+        p.assign(z)
+        Ap.assign(Az)
 
-        wp.launch(
-            kernel=_cg_kernel_1,
-            dim=x.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, rz_old, p_Ap, x, r, p, Ap, batch_offsets],
+        def do_iteration():
+            zAz_old.assign(zAz_new)
+
+            if M is not None:
+                M.matvec(Ap, y, y, alpha=1.0, beta=0.0)
+            tiled_dot.compute(Ap, y, col_offset=1)
+            y_Ap = tiled_dot.col(1)
+
+            if M is None:
+                # In non-preconditioned case, first kernel is same as CG
+                wp.launch(
+                    kernel=_cg_kernel_1,
+                    dim=x.shape[0],
+                    device=device,
+                    inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, p, Ap, batch_offsets],
+                )
+            else:
+                # In preconditioned case, we have one more vector to update
+                wp.launch(
+                    kernel=_cr_kernel_1,
+                    dim=x.shape[0],
+                    device=device,
+                    inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, z, p, Ap, y, batch_offsets],
+                )
+
+            update_rr_zAz()
+            wp.launch(
+                kernel=_cr_kernel_2,
+                dim=z.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap, batch_offsets],
+            )
+
+        return _run_capturable_loop(
+            do_iteration,
+            cycle_size=1,
+            r_norm_sq=r_norm_sq,
+            maxiter=self._maxiter,
+            atol_sq=atol_sq,
+            callback=self._callback,
+            check_every=self._check_every,
+            use_cuda_graph=self._use_cuda_graph,
         )
-
-        update_rr_rz()
-
-        wp.launch(
-            kernel=_cg_kernel_2,
-            dim=z.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p, batch_offsets],
-        )
-
-    return _run_capturable_loop(do_iteration, r_norm_sq, maxiter, atol_sq, callback, check_every, use_cuda_graph)
 
 
 def cr(
@@ -595,7 +898,8 @@ def cr(
     callback: Callable | None = None,
     check_every=10,
     use_cuda_graph=True,
-) -> tuple[int, float, float]:
+    run: bool = True,
+) -> tuple[int, float, float] | tuple[wp.array, wp.array, wp.array] | CR:
     """Compute an approximate solution to a symmetric, positive-definite linear system
     using the Conjugate Residual algorithm.
 
@@ -616,133 +920,237 @@ def cr(
             to the maximum number of iterations.
         use_cuda_graph: If true and when run on a CUDA device, capture the solver iteration as a CUDA graph for reduced launch overhead.
           The linear operator and preconditioner must only perform graph-friendly operations.
+        run: If ``True`` (default), allocate temporary buffers and immediately run the solver. If ``False``, return a
+            pre-allocated :class:`CR` functor that can be called repeatedly on compatible systems (same shape, batch
+            count, dtype, device) without re-allocating.
 
     Returns:
-        If `check_every` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
+        If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
             - residual_norm: The final residual norm ||b - Ax||
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
-        If `check_every` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
+        If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
             - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
+        If ``run`` is ``False``: a :class:`CR` functor with all temporary buffers pre-allocated.
+
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
-
-    A = aslinearoperator(A)
-    M = aslinearoperator(M)
-
-    batch_count = A.batch_count
-    batch_offsets = (
-        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
-    )
-
-    if maxiter == 0:
-        maxiter = A.shape[0] // batch_count
-
-    device = A.device
-    scalar_type = type_scalar_type(A.dtype)
-
-    # Notations below follow roughly pseudo-code from https://en.wikipedia.org/wiki/Conjugate_residual_method
-    # with z := M^-1 r and y := M^-1 Ap
-
-    # Temp storage — residuals are per-subproblem
-    r_and_z = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
-    r_and_Az = wp.empty_like(r_and_z)
-    y_and_Ap = wp.empty_like(r_and_z)
-    p = wp.empty_like(b)
-    residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
-
-    tiled_dot = TiledDot(
-        max_length=A.shape[0],
-        device=device,
-        scalar_type=scalar_type,
-        max_column_count=2,
-        batch_offsets=A.batch_offsets,
-    )
-
-    if M is None:
-        r_and_z = _repeat_first(r_and_z)
-        y_and_Ap = _repeat_first(y_and_Ap)
-
-    # named views
-    r, z = r_and_z[0], r_and_z[1]
-    r_copy, Az = r_and_Az[0], r_and_Az[1]
-
-    y, Ap = y_and_Ap[0], y_and_Ap[1]
-
-    r_norm_sq = tiled_dot.col(0)
-    zAz_new = tiled_dot.col(1)
-    zAz_old, atol_sq = residuals[0], residuals[1]
-
-    # Initialize tolerance from right-hand-side norm
-    _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
-    # Initialize residual
-    A.matvec(x, b, r, alpha=-1.0, beta=1.0)
-
-    # Not strictly necessary, but makes it more robust to user-provided LinearOperators
-    y_and_Ap.zero_()
-
-    # z = M r
-    if M is not None:
-        z.zero_()
-        M.matvec(r, z, z, alpha=1.0, beta=0.0)
-
-    def update_rr_zAz():
-        A.matvec(z, Az, Az, alpha=1, beta=0)
-        r_copy.assign(r)
-        tiled_dot.compute(r_and_z, r_and_Az)
-
-    update_rr_zAz()
-
-    p.assign(z)
-    Ap.assign(Az)
-
-    def do_iteration():
-        zAz_old.assign(zAz_new)
-
-        if M is not None:
-            M.matvec(Ap, y, y, alpha=1.0, beta=0.0)
-        tiled_dot.compute(Ap, y, col_offset=1)
-        y_Ap = tiled_dot.col(1)
-
-        if M is None:
-            # In non-preconditioned case, first kernel is same as CG
-            wp.launch(
-                kernel=_cg_kernel_1,
-                dim=x.shape[0],
-                device=device,
-                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, p, Ap, batch_offsets],
-            )
-        else:
-            # In preconditioned case, we have one more vector to update
-            wp.launch(
-                kernel=_cr_kernel_1,
-                dim=x.shape[0],
-                device=device,
-                inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, z, p, Ap, y, batch_offsets],
-            )
-
-        update_rr_zAz()
-        wp.launch(
-            kernel=_cr_kernel_2,
-            dim=z.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap, batch_offsets],
-        )
-
-    return _run_capturable_loop(
-        do_iteration,
-        cycle_size=1,
-        r_norm_sq=r_norm_sq,
+    state = CR(
+        A,
+        b,
+        x,
+        tol=tol,
+        atol=atol,
         maxiter=maxiter,
-        atol_sq=atol_sq,
+        M=M,
         callback=callback,
         check_every=check_every,
         use_cuda_graph=use_cuda_graph,
     )
+    if run:
+        return state()
+    return state
+
+
+class BiCGSTAB(LinearSolverState):
+    """Pre-allocated state for the BiConjugate Gradient Stabilized solver.
+
+    See :class:`LinearSolverState` for the shared constructor parameters, plus:
+
+    Args:
+        is_left_preconditioner: whether ``M`` should be used as a left- or right- preconditioner.
+
+    Unlike :class:`CG` and :class:`CR`, the presence of ``M`` is fixed at construction:
+    if ``M`` was ``None``, subsequent calls must also have ``M`` ``None``; otherwise a
+    compatible preconditioner must be supplied.
+    """
+
+    def __init__(
+        self,
+        A: _Matrix,
+        b: wp.array,
+        x: wp.array,
+        tol: float | None = None,
+        atol: float | None = None,
+        maxiter: float | None = 0,
+        M: _Matrix | None = None,
+        callback: Callable | None = None,
+        check_every: int = 10,
+        use_cuda_graph: bool = True,
+        is_left_preconditioner: bool = False,
+    ):
+        self._is_left_preconditioner = is_left_preconditioner
+        super().__init__(
+            A,
+            b,
+            x,
+            tol=tol,
+            atol=atol,
+            maxiter=maxiter,
+            M=M,
+            callback=callback,
+            check_every=check_every,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _allocate(self):
+        A = self._A
+        b = self._b
+        M = self._M
+        device = self._device
+        scalar_type = self._scalar_type
+        batch_count = self._batch_count
+
+        # Notations follow https://en.wikipedia.org/wiki/Biconjugate_gradient_stabilized_method
+        self._r_and_r0 = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
+        self._p = wp.empty_like(b)
+        self._v = wp.empty_like(b)
+        self._t = wp.empty_like(b)
+        self._r_repeated = _repeat_first(self._r_and_r0)
+
+        # Preconditioner-dependent buffers are fixed at construction
+        if M is not None:
+            self._y = wp.zeros_like(self._p)
+            self._z = wp.zeros_like(self._r_and_r0[0])
+            if self._is_left_preconditioner:
+                self._Mt = wp.zeros_like(self._t)
+            else:
+                self._Mt = self._t
+        else:
+            self._y = self._p
+            self._z = self._r_and_r0[0]
+            self._Mt = self._t
+
+        self._tiled_dot = TiledDot(
+            max_length=A.shape[0],
+            device=device,
+            scalar_type=scalar_type,
+            max_column_count=5,
+            batch_offsets=A.batch_offsets,
+        )
+
+        self._atol_sq = wp.empty(batch_count, dtype=scalar_type, device=device)
+
+    def _check_compatible(self, A, b, x, M):
+        super()._check_compatible(A, b, x, M)
+        # BiCGSTAB allocation depends on whether M is provided — require consistency
+        if (M is None) != (self._M is None):
+            raise ValueError(
+                "BiCGSTAB requires M to be consistently provided between construction and call "
+                "(both None or both non-None)"
+            )
+
+    def _run(self, A, b, x, M):
+        device = self._device
+        batch_offsets = self._batch_offsets
+        tiled_dot = self._tiled_dot
+        is_left_preconditioner = self._is_left_preconditioner
+
+        r_and_r0 = self._r_and_r0
+        p = self._p
+        v = self._v
+        t = self._t
+        r_repeated = self._r_repeated
+
+        r, r0 = r_and_r0[0], r_and_r0[1]
+        y = self._y
+        z = self._z
+        Mt = self._Mt
+
+        r_norm_sq = tiled_dot.col(0)
+        rho = tiled_dot.col(1)
+        atol_sq = self._atol_sq
+
+        # Initialize tolerance from right-hand-side norm
+        _initialize_absolute_tolerance(b, self._tol, self._atol, tiled_dot, atol_sq)
+        # Initialize residual
+        A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+        tiled_dot.compute(r, r, col_offset=0)
+
+        p.assign(r)
+        r0.assign(r)
+        rho.assign(r_norm_sq)
+
+        # Not strictly necessary, but makes it more robust to user-provided LinearOperators
+        v.zero_()
+        t.zero_()
+
+        def do_iteration():
+            # y = M p
+            if M is not None:
+                M.matvec(p, y, y, alpha=1.0, beta=0.0)
+
+            # v = A * y;
+            A.matvec(y, v, v, alpha=1, beta=0)
+
+            # alpha = rho / <r0 . v>
+            tiled_dot.compute(r0, v, col_offset=2)
+            r0v = tiled_dot.col(2)
+
+            #  x += alpha y
+            #  r -= alpha v
+            wp.launch(
+                kernel=_bicgstab_kernel_1,
+                dim=x.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, rho, r0v, x, r, y, v, batch_offsets],
+            )
+            tiled_dot.compute(r, r, col_offset=0)
+
+            # z = M r
+            if M is not None:
+                M.matvec(r, z, z, alpha=1.0, beta=0.0)
+
+            # t = A z
+            A.matvec(z, t, t, alpha=1, beta=0)
+
+            if M is not None and is_left_preconditioner:
+                # Mt = M t
+                M.matvec(t, Mt, Mt, alpha=1.0, beta=0.0)
+
+                # omega = <Mt, Ms> / <Mt, Mt>
+                tiled_dot.compute(z, Mt, col_offset=3)
+                tiled_dot.compute(Mt, Mt, col_offset=4)
+            else:
+                tiled_dot.compute(r, t, col_offset=3)
+                tiled_dot.compute(t, t, col_offset=4)
+            st = tiled_dot.col(3)
+            tt = tiled_dot.col(4)
+
+            # x += omega z
+            # r -= omega t
+            wp.launch(
+                kernel=_bicgstab_kernel_2,
+                dim=z.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, st, tt, z, t, x, r, batch_offsets],
+            )
+
+            # r = <r,r>, rho = <r0, r>
+            tiled_dot.compute(r_and_r0, r_repeated, col_offset=0)
+
+            # beta = (rho / rho_old) * alpha / omega = (rho / r0v) / omega
+            # p = r + beta (p - omega v)
+            wp.launch(
+                kernel=_bicgstab_kernel_3,
+                dim=z.shape[0],
+                device=device,
+                inputs=[atol_sq, r_norm_sq, rho, r0v, st, tt, p, r, v, batch_offsets],
+            )
+
+        return _run_capturable_loop(
+            do_iteration,
+            r_norm_sq=r_norm_sq,
+            maxiter=self._maxiter,
+            atol_sq=atol_sq,
+            callback=self._callback,
+            check_every=self._check_every,
+            use_cuda_graph=self._use_cuda_graph,
+        )
 
 
 def bicgstab(
@@ -757,6 +1165,7 @@ def bicgstab(
     check_every=10,
     use_cuda_graph=True,
     is_left_preconditioner=False,
+    run: bool = True,
 ):
     """Compute an approximate solution to a linear system using the Biconjugate Gradient Stabilized method (BiCGSTAB).
 
@@ -777,153 +1186,276 @@ def bicgstab(
         use_cuda_graph: If true and when run on a CUDA device, capture the solver iteration as a CUDA graph for reduced launch overhead.
             The linear operator and preconditioner must only perform graph-friendly operations.
         is_left_preconditioner: whether `M` should be used as a left- or right- preconditioner.
+        run: If ``True`` (default), allocate temporary buffers and immediately run the solver. If ``False``, return a
+            pre-allocated :class:`BiCGSTAB` functor that can be called repeatedly on compatible systems (same shape,
+            batch count, dtype, device) without re-allocating. Whether ``M`` was provided at construction must match
+            subsequent calls.
 
     Returns:
-        If `check_every` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
+        If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
             - residual_norm: The final residual norm ||b - Ax||
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
-        If `check_every` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
+        If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
             - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
+        If ``run`` is ``False``: a :class:`BiCGSTAB` functor with all temporary buffers pre-allocated.
+
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
-    A = aslinearoperator(A)
-    M = aslinearoperator(M)
-
-    batch_count = A.batch_count
-    batch_offsets = (
-        A.batch_offsets if A.batch_offsets is not None else wp.array([0, A.shape[0]], dtype=int, device=A.device)
-    )
-
-    if maxiter == 0:
-        maxiter = A.shape[0] // batch_count
-
-    device = A.device
-    scalar_type = type_scalar_type(A.dtype)
-
-    # Notations below follow pseudo-code from biconjugate https://en.wikipedia.org/wiki/Biconjugate_gradient_stabilized_method
-
-    # Temp storage — atol_sq is per-subproblem
-    r_and_r0 = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
-    p = wp.empty_like(b)
-    v = wp.empty_like(b)
-    t = wp.empty_like(b)
-
-    r, r0 = r_and_r0[0], r_and_r0[1]
-    r_repeated = _repeat_first(r_and_r0)
-
-    if M is not None:
-        y = wp.zeros_like(p)
-        z = wp.zeros_like(r)
-        if is_left_preconditioner:
-            Mt = wp.zeros_like(t)
-    else:
-        y = p
-        z = r
-        Mt = t
-
-    tiled_dot = TiledDot(
-        max_length=A.shape[0],
-        device=device,
-        scalar_type=scalar_type,
-        max_column_count=5,
-        batch_offsets=A.batch_offsets,
-    )
-    r_norm_sq = tiled_dot.col(0)
-    rho = tiled_dot.col(1)
-
-    atol_sq = wp.empty(batch_count, dtype=scalar_type, device=device)
-
-    # Initialize tolerance from right-hand-side norm
-    _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
-    # Initialize residual
-    A.matvec(x, b, r, alpha=-1.0, beta=1.0)
-    tiled_dot.compute(r, r, col_offset=0)
-
-    p.assign(r)
-    r0.assign(r)
-    rho.assign(r_norm_sq)
-
-    # Not strictly necessary, but makes it more robust to user-provided LinearOperators
-    v.zero_()
-    t.zero_()
-
-    def do_iteration():
-        # y = M p
-        if M is not None:
-            M.matvec(p, y, y, alpha=1.0, beta=0.0)
-
-        # v = A * y;
-        A.matvec(y, v, v, alpha=1, beta=0)
-
-        # alpha = rho / <r0 . v>
-        tiled_dot.compute(r0, v, col_offset=2)
-        r0v = tiled_dot.col(2)
-
-        #  x += alpha y
-        #  r -= alpha v
-        wp.launch(
-            kernel=_bicgstab_kernel_1,
-            dim=x.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, rho, r0v, x, r, y, v, batch_offsets],
-        )
-        tiled_dot.compute(r, r, col_offset=0)
-
-        # z = M r
-        if M is not None:
-            M.matvec(r, z, z, alpha=1.0, beta=0.0)
-
-        # t = A z
-        A.matvec(z, t, t, alpha=1, beta=0)
-
-        if M is not None and is_left_preconditioner:
-            # Mt = M t
-            M.matvec(t, Mt, Mt, alpha=1.0, beta=0.0)
-
-            # omega = <Mt, Ms> / <Mt, Mt>
-            tiled_dot.compute(z, Mt, col_offset=3)
-            tiled_dot.compute(Mt, Mt, col_offset=4)
-        else:
-            tiled_dot.compute(r, t, col_offset=3)
-            tiled_dot.compute(t, t, col_offset=4)
-        st = tiled_dot.col(3)
-        tt = tiled_dot.col(4)
-
-        # x += omega z
-        # r -= omega t
-        wp.launch(
-            kernel=_bicgstab_kernel_2,
-            dim=z.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, st, tt, z, t, x, r, batch_offsets],
-        )
-
-        # r = <r,r>, rho = <r0, r>
-        tiled_dot.compute(r_and_r0, r_repeated, col_offset=0)
-
-        # beta = (rho / rho_old) * alpha / omega = (rho / r0v) / omega
-        # p = r + beta (p - omega v)
-        wp.launch(
-            kernel=_bicgstab_kernel_3,
-            dim=z.shape[0],
-            device=device,
-            inputs=[atol_sq, r_norm_sq, rho, r0v, st, tt, p, r, v, batch_offsets],
-        )
-
-    return _run_capturable_loop(
-        do_iteration,
-        r_norm_sq=r_norm_sq,
+    state = BiCGSTAB(
+        A,
+        b,
+        x,
+        tol=tol,
+        atol=atol,
         maxiter=maxiter,
-        atol_sq=atol_sq,
+        M=M,
         callback=callback,
         check_every=check_every,
         use_cuda_graph=use_cuda_graph,
+        is_left_preconditioner=is_left_preconditioner,
     )
+    if run:
+        return state()
+    return state
+
+
+class GMRES(LinearSolverState):
+    """Pre-allocated state for the restarted Generalized Minimum Residual solver.
+
+    See :class:`LinearSolverState` for the shared constructor parameters, plus:
+
+    Args:
+        restart: the ``k`` in ``GMRES[k]``. Determines the size of the Krylov subspace and the
+            corresponding Hessenberg/basis allocations. Larger values reduce iteration count at
+            the cost of memory.
+        is_left_preconditioner: whether ``M`` should be used as a left- or right- preconditioner.
+
+    The preconditioner ``M`` may be freely changed (or toggled between ``None`` and a valid
+    operator) between calls. Batching is not supported.
+    """
+
+    def __init__(
+        self,
+        A: _Matrix,
+        b: wp.array,
+        x: wp.array,
+        tol: float | None = None,
+        atol: float | None = None,
+        restart: int = 31,
+        maxiter: float | None = 0,
+        M: _Matrix | None = None,
+        callback: Callable | None = None,
+        check_every: int = 31,
+        use_cuda_graph: bool = True,
+        is_left_preconditioner: bool = False,
+    ):
+        self._restart = restart
+        self._is_left_preconditioner = is_left_preconditioner
+        super().__init__(
+            A,
+            b,
+            x,
+            tol=tol,
+            atol=atol,
+            maxiter=maxiter,
+            M=M,
+            callback=callback,
+            check_every=check_every,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _allocate(self):
+        A = self._A
+        b = self._b
+        device = self._device
+        scalar_dtype = self._scalar_type
+
+        if self._batch_count > 1:
+            raise NotImplementedError("GMRES does not support batching yet")
+
+        # Cap restart at maxiter; align check_every with restart
+        restart = min(self._restart, self._maxiter)
+        self._restart = restart
+        if self._check_every > 0:
+            self._check_every = max(restart, self._check_every)
+
+        self._pivot_tolerance = _get_dtype_epsilon(scalar_dtype) ** 2
+
+        self._r = wp.empty_like(b)
+        self._w = wp.empty_like(self._r)
+
+        self._H = wp.empty(shape=(restart + 1, restart), dtype=scalar_dtype, device=device)
+        self._y = wp.empty(shape=restart + 1, dtype=scalar_dtype, device=device)
+
+        self._V = wp.zeros(shape=(restart + 1, self._r.shape[0]), dtype=self._r.dtype, device=device)
+
+        self._residuals = wp.empty(2, dtype=scalar_dtype, device=device)
+        self._beta = self._residuals[0:1]
+        self._atol_sq = self._residuals[1:2]
+
+        self._tiled_dot = TiledDot(
+            max_length=A.shape[0], device=device, scalar_type=scalar_dtype, max_column_count=restart + 1
+        )
+
+        w = self._w
+        self._w_repeated = wp.array(
+            ptr=w.ptr, shape=(restart + 1, w.shape[0]), strides=(0, w.strides[0]), dtype=w.dtype, device=w.device
+        )
+
+        # tile size for least square solve
+        # (need to fit in a CUDA block, so 1024 max)
+        if device.is_cuda and 4 < restart <= 1024:
+            tile_size = 1 << math.ceil(math.log2(restart))
+            least_squares_kernel = make_gmres_solve_least_squares_kernel_tiled(tile_size)
+        else:
+            tile_size = 1
+            least_squares_kernel = _gmres_solve_least_squares
+
+        self._tile_size = tile_size
+
+        # recorded launches — all reference internal buffers, safe to reuse across calls
+        self._least_squares_solve = wp.launch(
+            least_squares_kernel,
+            dim=(1, tile_size),
+            block_dim=tile_size if tile_size > 1 else 256,
+            device=device,
+            inputs=[restart, self._pivot_tolerance, self._beta, self._H, self._y],
+            record_cmd=True,
+        )
+
+        self._normalize_arnoldi_vec = wp.launch(
+            _gmres_arnoldi_normalize_kernel,
+            dim=self._r.shape,
+            device=self._r.device,
+            inputs=[self._r, self._w, self._tiled_dot.col(0), self._beta],
+            record_cmd=True,
+        )
+
+        self._arnoldi_axpy = wp.launch(
+            _gmres_arnoldi_axpy_kernel,
+            dim=(self._w.shape[0], tile_size),
+            block_dim=tile_size,
+            device=self._w.device,
+            inputs=[self._V, self._w, self._H],
+            record_cmd=True,
+        )
+
+    def _run(self, A, b, x, M):
+        device = self._device
+        scalar_dtype = self._scalar_type
+        restart = self._restart
+        is_left_preconditioner = self._is_left_preconditioner
+
+        tiled_dot = self._tiled_dot
+        r = self._r
+        w = self._w
+        H = self._H
+        y = self._y
+        V = self._V
+        beta = self._beta
+        atol_sq = self._atol_sq
+        w_repeated = self._w_repeated
+        r_norm_sq = tiled_dot.col(0)
+
+        least_squares_solve = self._least_squares_solve
+        normalize_arnoldi_vec = self._normalize_arnoldi_vec
+        arnoldi_axpy = self._arnoldi_axpy
+
+        # Initialize tolerance from right-hand-side norm
+        _initialize_absolute_tolerance(b, self._tol, self._atol, tiled_dot, atol_sq)
+        # Initialize residual
+        A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+        tiled_dot.compute(r, r, col_offset=0)
+
+        # Not strictly necessary, but makes it more robust to user-provided LinearOperators
+        w.zero_()
+
+        def array_coeff(H, i, j):
+            return H[i][j : j + 1]
+
+        def array_col(H, j):
+            return H[: j + 1, j : j + 1]
+
+        def do_arnoldi_iteration(j: int):
+            # w = A * v[j];
+            if M is not None:
+                tmp = V[j + 1]
+
+                if is_left_preconditioner:
+                    A.matvec(V[j], tmp, tmp, alpha=1, beta=0)
+                    M.matvec(tmp, w, w, alpha=1, beta=0)
+                else:
+                    M.matvec(V[j], tmp, tmp, alpha=1, beta=0)
+                    A.matvec(tmp, w, w, alpha=1, beta=0)
+            else:
+                A.matvec(V[j], w, w, alpha=1, beta=0)
+
+            # compute and apply dot products in rappel,
+            # since Hj columns are orthogonal
+            Hj = array_col(H, j)
+            tiled_dot.compute(w_repeated, V[: j + 1])
+            wp.copy(src=tiled_dot.cols(j + 1), dest=Hj)
+
+            # w -= w.vi vi
+            arnoldi_axpy.set_params([V[: j + 1], w, Hj])
+            arnoldi_axpy.launch()
+
+            # H[j+1, j] = |w.w|
+            tiled_dot.compute(w, w)
+            normalize_arnoldi_vec.set_params([w, V[j + 1], tiled_dot.col(0), array_coeff(H, j + 1, j)])
+
+            normalize_arnoldi_vec.launch()
+
+        def do_restart_cycle():
+            if M is not None and is_left_preconditioner:
+                M.matvec(r, w, w, alpha=1, beta=0)
+                rh = w
+            else:
+                rh = r
+
+            # beta^2 = rh.rh
+            tiled_dot.compute(rh, rh)
+
+            # v[0] = r / beta
+            normalize_arnoldi_vec.set_params([rh, V[0], tiled_dot.col(0), beta])
+            normalize_arnoldi_vec.launch()
+
+            for j in range(restart):
+                do_arnoldi_iteration(j)
+
+            least_squares_solve.launch()
+
+            # update x
+            if M is None or is_left_preconditioner:
+                wp.launch(
+                    _gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(1.0), y, V, x]
+                )
+            else:
+                wp.launch(
+                    _gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(0.0), y, V, w]
+                )
+                M.matvec(w, x, x, alpha=1, beta=1)
+
+            # update r and residual
+            wp.copy(src=b, dest=r)
+            A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+            tiled_dot.compute(r, r)
+
+        return _run_capturable_loop(
+            do_restart_cycle,
+            cycle_size=restart,
+            r_norm_sq=r_norm_sq,
+            maxiter=self._maxiter,
+            atol_sq=atol_sq,
+            callback=self._callback,
+            check_every=self._check_every,
+            use_cuda_graph=self._use_cuda_graph,
+        )
 
 
 def gmres(
@@ -939,6 +1471,7 @@ def gmres(
     check_every=31,
     use_cuda_graph=True,
     is_left_preconditioner=False,
+    run: bool = True,
 ):
     """Compute an approximate solution to a linear system using the restarted Generalized Minimum Residual method (GMRES[k]).
 
@@ -961,180 +1494,42 @@ def gmres(
         use_cuda_graph: If true and when run on a CUDA device, capture the solver iteration as a CUDA graph for reduced launch overhead.
           The linear operator and preconditioner must only perform graph-friendly operations.
         is_left_preconditioner: whether `M` should be used as a left- or right- preconditioner.
+        run: If ``True`` (default), allocate temporary buffers and immediately run the solver. If ``False``, return a
+            pre-allocated :class:`GMRES` functor that can be called repeatedly on compatible systems (same shape,
+            dtype, device) without re-allocating.
 
     Returns:
-        If `check_every` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
+        If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
             - residual_norm: The final residual norm ||b - Ax||
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
-        If `check_every` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
+        If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
             - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
+        If ``run`` is ``False``: a :class:`GMRES` functor with all temporary buffers pre-allocated.
+
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
-
-    A = aslinearoperator(A)
-    M = aslinearoperator(M)
-
-    if A.batch_count > 1:
-        raise NotImplementedError("GMRES does not support batching yet")
-
-    if maxiter == 0:
-        maxiter = A.shape[0]
-
-    restart = min(restart, maxiter)
-
-    if check_every > 0:
-        check_every = max(restart, check_every)
-
-    device = A.device
-    scalar_dtype = type_scalar_type(A.dtype)
-
-    pivot_tolerance = _get_dtype_epsilon(scalar_dtype) ** 2
-
-    r = wp.empty_like(b)
-    w = wp.empty_like(r)
-
-    H = wp.empty(shape=(restart + 1, restart), dtype=scalar_dtype, device=device)
-    y = wp.empty(shape=restart + 1, dtype=scalar_dtype, device=device)
-
-    V = wp.zeros(shape=(restart + 1, r.shape[0]), dtype=r.dtype, device=device)
-
-    residuals = wp.empty(2, dtype=scalar_dtype, device=device)
-    beta, atol_sq = residuals[0:1], residuals[1:2]
-
-    tiled_dot = TiledDot(max_length=A.shape[0], device=device, scalar_type=scalar_dtype, max_column_count=restart + 1)
-    r_norm_sq = tiled_dot.col(0)
-
-    w_repeated = wp.array(
-        ptr=w.ptr, shape=(restart + 1, w.shape[0]), strides=(0, w.strides[0]), dtype=w.dtype, device=w.device
-    )
-
-    # tile size for least square solve
-    # (need to fit in a CUDA block, so 1024 max)
-    if device.is_cuda and 4 < restart <= 1024:
-        tile_size = 1 << math.ceil(math.log2(restart))
-        least_squares_kernel = make_gmres_solve_least_squares_kernel_tiled(tile_size)
-    else:
-        tile_size = 1
-        least_squares_kernel = _gmres_solve_least_squares
-
-    # recorded launches
-    least_squares_solve = wp.launch(
-        least_squares_kernel,
-        dim=(1, tile_size),
-        block_dim=tile_size if tile_size > 1 else 256,
-        device=device,
-        inputs=[restart, pivot_tolerance, beta, H, y],
-        record_cmd=True,
-    )
-
-    normalize_anorldi_vec = wp.launch(
-        _gmres_arnoldi_normalize_kernel,
-        dim=r.shape,
-        device=r.device,
-        inputs=[r, w, tiled_dot.col(0), beta],
-        record_cmd=True,
-    )
-
-    arnoldi_axpy = wp.launch(
-        _gmres_arnoldi_axpy_kernel,
-        dim=(w.shape[0], tile_size),
-        block_dim=tile_size,
-        device=w.device,
-        inputs=[V, w, H],
-        record_cmd=True,
-    )
-
-    # Initialize tolerance from right-hand-side norm
-    _initialize_absolute_tolerance(b, tol, atol, tiled_dot, atol_sq)
-    # Initialize residual
-    A.matvec(x, b, r, alpha=-1.0, beta=1.0)
-    tiled_dot.compute(r, r, col_offset=0)
-
-    # Not strictly necessary, but makes it more robust to user-provided LinearOperators
-    w.zero_()
-
-    def array_coeff(H, i, j):
-        return H[i][j : j + 1]
-
-    def array_col(H, j):
-        return H[: j + 1, j : j + 1]
-
-    def do_arnoldi_iteration(j: int):
-        # w = A * v[j];
-        if M is not None:
-            tmp = V[j + 1]
-
-            if is_left_preconditioner:
-                A.matvec(V[j], tmp, tmp, alpha=1, beta=0)
-                M.matvec(tmp, w, w, alpha=1, beta=0)
-            else:
-                M.matvec(V[j], tmp, tmp, alpha=1, beta=0)
-                A.matvec(tmp, w, w, alpha=1, beta=0)
-        else:
-            A.matvec(V[j], w, w, alpha=1, beta=0)
-
-        # compute and apply dot products in rappel,
-        # since Hj columns are orthogonal
-        Hj = array_col(H, j)
-        tiled_dot.compute(w_repeated, V[: j + 1])
-        wp.copy(src=tiled_dot.cols(j + 1), dest=Hj)
-
-        # w -= w.vi vi
-        arnoldi_axpy.set_params([V[: j + 1], w, Hj])
-        arnoldi_axpy.launch()
-
-        # H[j+1, j] = |w.w|
-        tiled_dot.compute(w, w)
-        normalize_anorldi_vec.set_params([w, V[j + 1], tiled_dot.col(0), array_coeff(H, j + 1, j)])
-
-        normalize_anorldi_vec.launch()
-
-    def do_restart_cycle():
-        if M is not None and is_left_preconditioner:
-            M.matvec(r, w, w, alpha=1, beta=0)
-            rh = w
-        else:
-            rh = r
-
-        # beta^2 = rh.rh
-        tiled_dot.compute(rh, rh)
-
-        # v[0] = r / beta
-        normalize_anorldi_vec.set_params([rh, V[0], tiled_dot.col(0), beta])
-        normalize_anorldi_vec.launch()
-
-        for j in range(restart):
-            do_arnoldi_iteration(j)
-
-        least_squares_solve.launch()
-
-        # update x
-        if M is None or is_left_preconditioner:
-            wp.launch(_gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(1.0), y, V, x])
-        else:
-            wp.launch(_gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(0.0), y, V, w])
-            M.matvec(w, x, x, alpha=1, beta=1)
-
-        # update r and residual
-        wp.copy(src=b, dest=r)
-        A.matvec(x, b, r, alpha=-1.0, beta=1.0)
-        tiled_dot.compute(r, r)
-
-    return _run_capturable_loop(
-        do_restart_cycle,
-        cycle_size=restart,
-        r_norm_sq=r_norm_sq,
+    state = GMRES(
+        A,
+        b,
+        x,
+        tol=tol,
+        atol=atol,
+        restart=restart,
         maxiter=maxiter,
-        atol_sq=atol_sq,
+        M=M,
         callback=callback,
         check_every=check_every,
         use_cuda_graph=use_cuda_graph,
+        is_left_preconditioner=is_left_preconditioner,
     )
+    if run:
+        return state()
+    return state
 
 
 def _repeat_first(arr: wp.array):

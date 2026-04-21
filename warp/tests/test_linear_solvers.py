@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 import warp as wp
-from warp.optim.linear import aslinearoperator, bicgstab, cg, cr, gmres, preconditioner
+from warp.optim.linear import CG, CR, GMRES, BiCGSTAB, aslinearoperator, bicgstab, cg, cr, gmres, preconditioner
 from warp.tests.unittest_utils import *
 
 
@@ -300,6 +300,83 @@ def test_batched_nonuniform(test, device, dtype=wp.float32):
     _check_batch_residuals(test, A_np_full, b_np_full, batch_sizes, x_full, 1e-5, dtype)
 
 
+def test_functor_reuse(test, device):
+    # For each solver, construct a pre-allocated functor, then re-run on a different
+    # (but compatible) system without re-allocating temporary buffers.
+    cases = [
+        (cg, CG, _make_spd_system, 32, {"maxiter": 500}),
+        (cr, CR, _make_spd_system, 32, {"maxiter": 500}),
+        (bicgstab, BiCGSTAB, _make_nonsymmetric_system, 32, {"maxiter": 500}),
+        (gmres, GMRES, _make_nonsymmetric_system, 16, {"tol": 1.0e-3, "restart": 16, "maxiter": 256}),
+    ]
+    with wp.ScopedDevice(device):
+        for func, klass, make_system, n, kwargs in cases:
+            A1, b1 = make_system(n=n, seed=11, dtype=wp.float64, device=device)
+            x1 = wp.zeros_like(b1)
+            state = func(A1, b1, x1, run=False, **kwargs)
+            test.assertIsInstance(state, klass)
+
+            # First run with the original system
+            _niter, err, atol = state()
+            test.assertLessEqual(err, atol)
+
+            # Second run with a *different* but compatible system
+            A2, b2 = make_system(n=n, seed=22, dtype=wp.float64, device=device)
+            x2 = wp.zeros_like(b2)
+            _niter2, err2, atol2 = state(A=A2, b=b2, x=x2)
+            test.assertLessEqual(err2, atol2)
+
+            # Residual check in numpy to confirm x2 really solves A2 x2 = b2
+            residual = A2.numpy() @ x2.numpy() - b2.numpy()
+            test.assertLessEqual(np.linalg.norm(residual), 2.0 * atol2)
+
+
+def test_functor_preconditioner(test, device):
+    # CG and CR allow toggling M between None and a valid preconditioner between calls.
+    with wp.ScopedDevice(device):
+        A, b = _make_spd_system(n=32, seed=33, dtype=wp.float64, device=device)
+        M = preconditioner(A, "diag")
+
+        for func in (cg, cr):
+            x = wp.zeros_like(b)
+            state = func(A, b, x, maxiter=500, run=False)
+
+            # No preconditioner on first call
+            _, err, atol = state()
+            test.assertLessEqual(err, atol)
+
+            # With preconditioner on second call
+            x.zero_()
+            _, err2, atol2 = state(M=M)
+            test.assertLessEqual(err2, atol2)
+
+
+def test_functor_compat_errors(test, device):
+    with wp.ScopedDevice(device):
+        A, b = _make_spd_system(n=32, seed=44, dtype=wp.float64, device=device)
+        x = wp.zeros_like(b)
+        state = cg(A, b, x, maxiter=100, run=False)
+
+        # Wrong b shape
+        b_bad = wp.zeros(64, dtype=wp.float64, device=device)
+        with test.assertRaises(ValueError):
+            state(b=b_bad)
+
+        # Wrong dtype
+        A_bad, b_bad = _make_spd_system(n=32, seed=44, dtype=wp.float32, device=device)
+        x_bad = wp.zeros_like(b_bad)
+        with test.assertRaises(ValueError):
+            state(A=A_bad, b=b_bad, x=x_bad)
+
+        # BiCGSTAB requires M presence to match
+        A2, b2 = _make_nonsymmetric_system(n=16, seed=45, dtype=wp.float64, device=device)
+        x2 = wp.zeros_like(b2)
+        M2 = preconditioner(A2, "diag")
+        bic_state = bicgstab(A2, b2, x2, maxiter=100, run=False)  # M=None at construction
+        with test.assertRaises(ValueError):
+            bic_state(M=M2)
+
+
 class TestLinearSolvers(unittest.TestCase):
     pass
 
@@ -315,6 +392,9 @@ add_function_test(TestLinearSolvers, "test_batched_cg_f64", test_batched_cg, dev
 add_function_test(TestLinearSolvers, "test_batched_cr_f32", test_batched_cr, devices=devices)
 add_function_test(TestLinearSolvers, "test_batched_bicgstab_f32", test_batched_bicgstab, devices=devices)
 add_function_test(TestLinearSolvers, "test_batched_nonuniform", test_batched_nonuniform, devices=devices)
+add_function_test(TestLinearSolvers, "test_functor_reuse", test_functor_reuse, devices=devices)
+add_function_test(TestLinearSolvers, "test_functor_preconditioner", test_functor_preconditioner, devices=devices)
+add_function_test(TestLinearSolvers, "test_functor_compat_errors", test_functor_compat_errors, devices=devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
