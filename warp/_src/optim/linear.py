@@ -7,8 +7,8 @@ from collections.abc import Callable
 from typing import Any
 
 import warp as wp
-import warp._src.sparse as sparse
-from warp._src.types import type_length, type_scalar_type
+import warp.sparse as sparse
+from warp._src.types import type_is_matrix, type_is_vector, type_length, type_scalar_type
 
 _wp_module_name_ = "warp.optim.linear"
 
@@ -72,7 +72,7 @@ class LinearOperator:
         return self._dtype
 
     @property
-    def device(self) -> wp._src.context.Device:
+    def device(self) -> wp.Device:
         return self._device
 
     @property
@@ -81,7 +81,7 @@ class LinearOperator:
 
     @property
     def scalar_type(self):
-        return wp._src.types.type_scalar_type(self.dtype)
+        return type_scalar_type(self.dtype)
 
     @property
     def batch_offsets(self) -> wp.array | None:
@@ -154,7 +154,7 @@ def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> Linea
         if A.ndim == 2:
             return LinearOperator(A.shape, A.dtype, A.device, matvec=dense_mv, batch_offsets=batch_offsets)
         if A.ndim == 1:
-            if wp._src.types.type_is_vector(A.dtype):
+            if type_is_vector(A.dtype):
                 return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv_vec, batch_offsets=batch_offsets)
             return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv, batch_offsets=batch_offsets)
     if isinstance(A, sparse.BsrMatrix):
@@ -182,7 +182,7 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
         use_abs = 1 if ptype == "diag_abs" else 0
         if isinstance(A, sparse.BsrMatrix):
             A_diag = sparse.bsr_get_diag(A)
-            if wp._src.types.type_is_matrix(A.dtype):
+            if type_is_matrix(A.dtype):
                 inv_diag = wp.empty(
                     shape=A.nrow, dtype=wp.types.vector(length=A.block_shape[0], dtype=A.scalar_type), device=A.device
                 )
@@ -643,7 +643,7 @@ def cr(
         maxiter = A.shape[0] // batch_count
 
     device = A.device
-    scalar_type = wp._src.types.type_scalar_type(A.dtype)
+    scalar_type = type_scalar_type(A.dtype)
 
     # Notations below follow roughly pseudo-code from https://en.wikipedia.org/wiki/Conjugate_residual_method
     # with z := M^-1 r and y := M^-1 Ap
@@ -803,7 +803,7 @@ def bicgstab(
         maxiter = A.shape[0] // batch_count
 
     device = A.device
-    scalar_type = wp._src.types.type_scalar_type(A.dtype)
+    scalar_type = type_scalar_type(A.dtype)
 
     # Notations below follow pseudo-code from biconjugate https://en.wikipedia.org/wiki/Biconjugate_gradient_stabilized_method
 
@@ -979,6 +979,9 @@ def gmres(
     A = aslinearoperator(A)
     M = aslinearoperator(M)
 
+    if A.batch_count > 1:
+        raise NotImplementedError("GMRES does not support batching yet")
+
     if maxiter == 0:
         maxiter = A.shape[0]
 
@@ -988,7 +991,7 @@ def gmres(
         check_every = max(restart, check_every)
 
     device = A.device
-    scalar_dtype = wp._src.types.type_scalar_type(A.dtype)
+    scalar_dtype = type_scalar_type(A.dtype)
 
     pivot_tolerance = _get_dtype_epsilon(scalar_dtype) ** 2
 
@@ -1220,6 +1223,8 @@ def _initialize_absolute_tolerance(
 
 @functools.cache
 def _create_update_condition_kernel(batch_count: int):
+    tile_size = max(32, min(512, 1 << math.ceil(math.log2(max(batch_count, 1)))))
+
     @wp.kernel(module="unique")
     def _update_condition(
         maxiter: int,
@@ -1229,14 +1234,23 @@ def _create_update_condition_kernel(batch_count: int):
         atol_sq: wp.array(dtype=Any),
         condition: wp.array(dtype=int),
     ):
-        cur_iter[0] += cycle_size
-        all_converged = True
-        for i in range(batch_count):
-            if r_norm_sq[i] > atol_sq[i]:
-                all_converged = False
-        condition[0] = wp.where(all_converged or cur_iter[0] >= maxiter, 0, 1)
+        _, lane = wp.tid()
 
-    return _update_condition
+        max_diff_tile = wp.tile_zeros(dtype=r_norm_sq.dtype, shape=(tile_size,))
+
+        for i in range(0, batch_count, wp.block_dim()):
+            r_norm_tile = wp.tile_load(r_norm_sq, shape=tile_size, offset=i)
+            atol_tile = wp.tile_load(atol_sq, shape=tile_size, offset=i)
+            diff_tile = wp.tile_map(wp.sub, r_norm_tile, atol_tile)
+            max_diff_tile = wp.tile_map(wp.max, max_diff_tile, diff_tile)
+
+        max_diff = wp.tile_max(max_diff_tile)
+        converged = max_diff[0] <= r_norm_sq.dtype(0.0)
+        if lane == 0:
+            cur_iter[0] += cycle_size
+            condition[0] = wp.where(converged or cur_iter[0] >= maxiter, 0, 1)
+
+    return _update_condition, tile_size
 
 
 def _run_capturable_loop(
@@ -1262,10 +1276,11 @@ def _run_capturable_loop(
     cur_iter = cur_iter_and_condition[0:1]
     condition = cur_iter_and_condition[1:2]
 
-    update_condition_kernel = _create_update_condition_kernel(batch_count)
+    update_condition_kernel, update_condition_tile_size = _create_update_condition_kernel(batch_count)
     update_condition_launch = wp.launch(
         update_condition_kernel,
-        dim=1,
+        dim=(1, update_condition_tile_size),
+        block_dim=update_condition_tile_size,
         device=device,
         inputs=[int(maxiter), cycle_size, cur_iter, r_norm_sq, atol_sq, condition],
         record_cmd=True,
