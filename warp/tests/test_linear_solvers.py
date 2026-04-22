@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 import warp as wp
+import warp.sparse as wps
 from warp.optim.linear import CG, CR, GMRES, BiCGSTAB, aslinearoperator, bicgstab, cg, cr, gmres, preconditioner
 from warp.tests.unittest_utils import *
 
@@ -435,6 +436,122 @@ def test_functor_compat_errors(test, device):
             bic_state(M=M2)
 
 
+def _make_block_spd_bsr(n_blocks: int, block_size: int, seed: int, dtype, device):
+    """Build an SPD block-dense BSR matrix with ``n_blocks`` by ``n_blocks`` blocks of
+    size ``block_size`` by ``block_size``, plus a matching right-hand side."""
+    rng = np.random.default_rng(seed)
+    n = n_blocks * block_size
+    C = rng.uniform(-1.0, 1.0, (n, n))
+    A_dense = C @ C.T + np.eye(n) * n  # strongly SPD
+    f = rng.uniform(-1.0, 1.0, n)
+    b_np = A_dense @ f
+
+    mat_type = wp.types.matrix(shape=(block_size, block_size), dtype=dtype)
+
+    rows = np.repeat(np.arange(n_blocks), n_blocks).astype(np.int32)
+    cols = np.tile(np.arange(n_blocks), n_blocks).astype(np.int32)
+    blocks = np.empty((rows.size, block_size, block_size))
+    for k, (br, bc) in enumerate(zip(rows, cols, strict=True)):
+        blocks[k] = A_dense[br * block_size : (br + 1) * block_size, bc * block_size : (bc + 1) * block_size]
+
+    A = wps.bsr_zeros(n_blocks, n_blocks, mat_type, device=device)
+    wps.bsr_set_from_triplets(
+        A,
+        wp.array(rows, dtype=int, device=device),
+        wp.array(cols, dtype=int, device=device),
+        wp.array(blocks, dtype=mat_type, device=device),
+    )
+
+    np_dtype = np.float32 if dtype == wp.float32 else np.float64
+    b = wp.array(b_np.astype(np_dtype), dtype=dtype, device=device)
+    return A, b, A_dense.astype(np_dtype), b_np.astype(np_dtype)
+
+
+def test_block_jacobi_preconditioner(test, device):
+    for dtype in (wp.float32, wp.float64):
+        A, b, A_dense, b_np = _make_block_spd_bsr(n_blocks=8, block_size=3, seed=12345, dtype=dtype, device=device)
+
+        tol = 1e-3 if dtype == wp.float32 else 1e-8
+        atol_scale = 32.0 if dtype == wp.float32 else 2.0
+
+        for ptype in ("diag", "block_jacobi", "block_jacobi_ldlt"):
+            M = preconditioner(A, ptype)
+            x = wp.zeros(A.shape[0], dtype=dtype, device=device)
+            with wp.ScopedDevice(A.device):
+                _, err, atol = cg(A, b, x, M=M, maxiter=1000, tol=tol, use_cuda_graph=False)
+            test.assertLessEqual(float(err), float(atol), msg=f"{ptype}/{dtype} did not converge")
+
+            # Residual in numpy for independent verification.
+            residual = A_dense @ x.numpy() - b_np
+            test.assertLessEqual(
+                np.linalg.norm(residual),
+                atol_scale * float(atol),
+                msg=f"{ptype}/{dtype} residual too large",
+            )
+
+
+def test_block_jacobi_input_errors(test, device):
+    # Dense array input must be rejected.
+    A_dense = wp.array(np.eye(8), dtype=wp.float64, device=device)
+    with test.assertRaises(ValueError):
+        preconditioner(A_dense, "block_jacobi")
+    with test.assertRaises(ValueError):
+        preconditioner(A_dense, "block_jacobi_ldlt")
+
+    # Non-square block shape must be rejected.
+    mat23 = wp.types.matrix(shape=(2, 3), dtype=wp.float64)
+    A_rect = wps.bsr_zeros(3, 4, mat23, device=device)
+    with test.assertRaises(ValueError):
+        preconditioner(A_rect, "block_jacobi")
+    with test.assertRaises(ValueError):
+        preconditioner(A_rect, "block_jacobi_ldlt")
+
+
+def test_block_jacobi_singular_block(test, device):
+    # One zero diagonal block: the preconditioner must remain well-defined
+    # (identity on the singular block row) rather than producing NaNs.
+    mat33 = wp.types.matrix(shape=(3, 3), dtype=wp.float64)
+    rows = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=int, device=device)
+    cols = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=int, device=device)
+    blocks = np.stack([np.zeros((3, 3)), np.eye(3), np.eye(3)])
+    vals = wp.array(blocks, dtype=mat33, device=device)
+
+    A = wps.bsr_zeros(3, 3, mat33, device=device)
+    wps.bsr_set_from_triplets(A, rows, cols, vals)
+
+    x = wp.array(np.arange(1, 10, dtype=np.float64), dtype=wp.float64, device=device)
+    for ptype in ("block_jacobi", "block_jacobi_ldlt"):
+        M = preconditioner(A, ptype)
+        z = wp.zeros_like(x)
+        M.matvec(x, z, z, alpha=1.0, beta=0.0)
+        z_np = z.numpy()
+        test.assertTrue(np.all(np.isfinite(z_np)), msg=f"{ptype}: non-finite output on singular block")
+        # Singular block row → identity applied → preserves x[:3]. Other rows → also identity here.
+        np.testing.assert_allclose(z_np, x.numpy(), rtol=0, atol=0, err_msg=f"{ptype}")
+
+
+def test_block_jacobi_scalar_fallback(test, device):
+    # A CSR (1x1 block) input should fall back to the scalar diag path and
+    # match the "diag" preconditioner bit-for-bit.
+    n = 10
+    rows = wp.array(np.arange(n, dtype=np.int32), dtype=int, device=device)
+    cols = wp.array(np.arange(n, dtype=np.int32), dtype=int, device=device)
+    vals = wp.array(np.full(n, 2.0, dtype=np.float64), dtype=wp.float64, device=device)
+
+    A = wps.bsr_zeros(n, n, wp.float64, device=device)
+    wps.bsr_set_from_triplets(A, rows, cols, vals)
+
+    M_block = preconditioner(A, "block_jacobi")
+    M_diag = preconditioner(A, "diag")
+
+    x = wp.array(np.arange(1, n + 1, dtype=np.float64), dtype=wp.float64, device=device)
+    z_block = wp.zeros_like(x)
+    z_diag = wp.zeros_like(x)
+    M_block.matvec(x, z_block, z_block, alpha=1.0, beta=0.0)
+    M_diag.matvec(x, z_diag, z_diag, alpha=1.0, beta=0.0)
+    np.testing.assert_allclose(z_block.numpy(), z_diag.numpy())
+
+
 class TestLinearSolvers(unittest.TestCase):
     pass
 
@@ -456,6 +573,16 @@ add_function_test(TestLinearSolvers, "test_batched_nonuniform", test_batched_non
 add_function_test(TestLinearSolvers, "test_functor_reuse", test_functor_reuse, devices=devices)
 add_function_test(TestLinearSolvers, "test_functor_preconditioner", test_functor_preconditioner, devices=devices)
 add_function_test(TestLinearSolvers, "test_functor_compat_errors", test_functor_compat_errors, devices=devices)
+add_function_test(
+    TestLinearSolvers, "test_block_jacobi_preconditioner", test_block_jacobi_preconditioner, devices=devices
+)
+add_function_test(TestLinearSolvers, "test_block_jacobi_input_errors", test_block_jacobi_input_errors, devices=devices)
+add_function_test(
+    TestLinearSolvers, "test_block_jacobi_singular_block", test_block_jacobi_singular_block, devices=devices
+)
+add_function_test(
+    TestLinearSolvers, "test_block_jacobi_scalar_fallback", test_block_jacobi_scalar_fallback, devices=devices
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

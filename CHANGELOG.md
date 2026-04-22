@@ -80,6 +80,9 @@
 - Add batched-input support to `warp.optim.linear` solvers: a
   `LinearOperator` built with `batch_offsets` partitions the DOF vector into independent subproblems that are all
   solved in a single launch sequence, with per-batch convergence checks.
+- Add block Jacobi preconditioners to `warp.optim.linear.preconditioner`:
+  ``"block_jacobi"`` (diagonal block inverse via QR) and ``"block_jacobi_ldlt"``
+  (LDL^T-based, for SPD diagonal blocks) for BSR matrices with square blocks.
 
 ### Removed
 

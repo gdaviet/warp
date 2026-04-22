@@ -185,11 +185,66 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
 
          - ``"diag"``: Diagonal (a.k.a. Jacobi) preconditioner
          - ``"diag_abs"``: Similar to Jacobi, but using the absolute value of diagonal coefficients
+         - ``"block_jacobi"``: Block Jacobi preconditioner; inverts each diagonal block of
+           a BSR matrix via QR. Requires a :class:`warp.sparse.BsrMatrix` with square blocks.
+         - ``"block_jacobi_ldlt"``: Block Jacobi using an LDL^T factorization of each
+           diagonal block; cheaper setup than ``"block_jacobi"`` but requires SPD diagonal
+           blocks. Requires a :class:`warp.sparse.BsrMatrix` with square blocks.
          - ``"id"``: Identity (null) preconditioner
     """
 
     if ptype == "id":
         return None
+
+    if ptype in ("block_jacobi", "block_jacobi_ldlt"):
+        if not isinstance(A, sparse.BsrMatrix):
+            raise ValueError(f"'{ptype}' preconditioner requires a BsrMatrix input")
+        block_shape = A.block_shape
+        if block_shape[0] != block_shape[1]:
+            raise ValueError(f"'{ptype}' preconditioner requires square blocks, got block_shape={block_shape}")
+        if block_shape[0] == 1:
+            # Scalar blocks: fall back to the existing pointwise Jacobi path.
+            return preconditioner(A, ptype="diag")
+
+        diag = sparse.bsr_get_diag(A)
+        blocks = wp.empty_like(diag)
+
+        if ptype == "block_jacobi":
+            wp.launch(
+                _invert_diagonal_blocks_qr,
+                dim=diag.shape,
+                device=diag.device,
+                inputs=[diag, blocks],
+            )
+            kernel = _block_diag_mv_inverse
+        else:
+            wp.launch(
+                _ldlt_diagonal_blocks,
+                dim=diag.shape,
+                device=diag.device,
+                inputs=[diag, blocks],
+            )
+            kernel = _block_diag_mv_ldlt
+
+        scalar_type = A.scalar_type
+        block_size = block_shape[0]
+
+        def block_diag_mv(x, y, z, alpha, beta):
+            wp.launch(
+                kernel,
+                dim=blocks.shape,
+                device=blocks.device,
+                inputs=[
+                    blocks,
+                    _as_vector_array(x, block_size),
+                    _as_vector_array(y, block_size),
+                    _as_vector_array(z, block_size),
+                    scalar_type(alpha),
+                    scalar_type(beta),
+                ],
+            )
+
+        return LinearOperator(A.shape, scalar_type, A.device, matvec=block_diag_mv)
 
     if ptype in ("diag", "diag_abs"):
         use_abs = 1 if ptype == "diag_abs" else 0
@@ -242,6 +297,30 @@ def _as_scalar_array(x: wp.array):
         dtype=scalar_type,
         device=x.device,
         grad=None if x.grad is None else _as_scalar_array(x.grad),
+    )
+    arr._ref = x
+    return arr
+
+
+def _as_vector_array(x: wp.array, length: int):
+    """View a 1-D scalar array as a 1-D array of fixed-length vectors.
+
+    The underlying storage is shared (no copy); ``x`` must be contiguous and its
+    length divisible by ``length``.
+    """
+    if length == 1:
+        return x
+    if x.shape[-1] % length != 0:
+        raise ValueError(f"Array length {x.shape[-1]} is not divisible by block size {length}")
+
+    vec_type = wp.types.vector(length=length, dtype=x.dtype)
+    arr = wp.array(
+        ptr=x.ptr,
+        shape=(*x.shape[:-1], x.shape[-1] // length),
+        strides=(*x.strides[:-1], x.strides[-1] * length),
+        dtype=vec_type,
+        device=x.device,
+        grad=None if x.grad is None else _as_vector_array(x.grad, length),
     )
     arr._ref = x
     return arr
@@ -1869,6 +1948,185 @@ def _extract_inverse_diagonal_dense(
     inv_diag[i] = _inverse_diag_coefficient(dense_matrix[i, i], use_abs != 0)
 
 
+# --- Block Jacobi preconditioner helpers --------------------------------------
+
+# Local re-implementations of QR-based dense inversion and Cholesky for small,
+# fixed-size blocks. Kept local to avoid a dependency from warp.optim onto
+# warp.fem.
+
+
+@wp.func
+def _qr_decomposition(A: Any):
+    # Householder QR: A = Q R, Q orthonormal, R upper triangular. Returns (Q, R).
+    x = type(A[0])()
+    Q = wp.identity(n=x.length, dtype=A.dtype)
+
+    zero = x.dtype(0.0)
+    two = x.dtype(2.0)
+
+    for i in range(x.length):
+        for k in range(x.length):
+            x[k] = wp.where(k < i, zero, A[k, i])
+
+        alpha = wp.length(x) * wp.sign(x[i])
+        x[i] += alpha
+        two_over_x_sq = wp.where(alpha == zero, zero, two / wp.length_sq(x))
+
+        A -= wp.outer(two_over_x_sq * x, x * A)
+        Q -= wp.outer(Q * x, two_over_x_sq * x)
+
+    return Q, A
+
+
+@wp.func
+def _solve_upper(R: Any, b: Any):
+    # Solve R x = b for upper-triangular R. Zero-safe (x_i = 0 if R_ii == 0).
+    zero = b.dtype(0)
+    x = type(b)(zero)
+    for i in range(b.length, 0, -1):
+        j = i - 1
+        r = b[j] - wp.dot(R[j], x)
+        x[j] = wp.where(R[j, j] == zero, zero, r / R[j, j])
+    return x
+
+
+@wp.func
+def _block_inverse_qr(A: Any):
+    # Inverse of a square block via QR. On a numerically singular block (any
+    # zero on the R diagonal), falls back to the identity so the preconditioner
+    # remains well-defined — mirrors the scalar Jacobi zero-safe behavior.
+    Q, R = _qr_decomposition(A)
+    row = type(A[0])()
+    zero = A.dtype(0)
+    one = A.dtype(1)
+    singular = wp.bool(False)
+    for j in range(row.length):
+        singular = singular or (R[j, j] == zero)
+
+    A_inv = type(A)()
+    for i in range(row.length):
+        A_inv[i] = _solve_upper(R, Q[i])  # i-th column of Q^T
+    inv = wp.transpose(A_inv)
+
+    for i in range(row.length):
+        for j in range(row.length):
+            inv[i, j] = wp.where(singular, wp.where(i == j, one, zero), inv[i, j])
+    return inv
+
+
+@wp.func
+def _block_ldlt(A: Any):
+    # LDL^T factorization A = L D L^T, with L unit lower triangular and D
+    # diagonal. Stored packed into a single matrix M: M[i, i] = D[i], and
+    # M[i, j] = L[i, j] for i > j (the unit diagonal of L is implicit). Falls
+    # back to identity on non-SPD input, so the preconditioner remains
+    # well-defined (apply becomes a pass-through on that block).
+    row = type(A[0])()
+    zero = A.dtype(0.0)
+    M = type(A)(zero)
+    spd = wp.bool(True)
+    for j in range(row.length):
+        d = A[j, j]
+        for k in range(j):
+            d -= M[j, k] * M[j, k] * M[k, k]
+
+        if d <= zero:
+            spd = False
+            break
+
+        M[j, j] = d
+        for i in range(j + 1, row.length):
+            t = A[i, j]
+            for k in range(j):
+                t -= M[i, k] * M[j, k] * M[k, k]
+            M[i, j] = t / d
+
+    if spd:
+        return M
+    return wp.identity(n=row.length, dtype=A.dtype)
+
+
+@wp.func
+def _apply_ldlt(M: Any, x: Any):
+    # Solve (L D L^T) z = x using the packed LDL^T form: M[i,i] = D[i],
+    # M[i,j] = L[i,j] for i > j, L unit lower triangular.
+    zero = x.dtype(0)
+
+    # Forward: L y = x (unit lower).
+    y = type(x)(zero)
+    for i in range(x.length):
+        r = x[i]
+        for j in range(i):
+            r -= M[i, j] * y[j]
+        y[i] = r
+
+    # Backward with D^{-1} folded in: solve L^T z = D^{-1} y (unit upper).
+    z = type(x)(zero)
+    for i in range(x.length, 0, -1):
+        idx = i - 1
+        r = y[idx] / M[idx, idx]
+        for j in range(idx + 1, x.length):
+            r -= M[j, idx] * z[j]
+        z[idx] = r
+    return z
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _invert_diagonal_blocks_qr(
+    diag: wp.array(dtype=Any),
+    inv_diag: wp.array(dtype=Any),
+):
+    i = wp.tid()
+    inv_diag[i] = _block_inverse_qr(diag[i])
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _ldlt_diagonal_blocks(
+    diag: wp.array(dtype=Any),
+    ldlt_blocks: wp.array(dtype=Any),
+):
+    i = wp.tid()
+    ldlt_blocks[i] = _block_ldlt(diag[i])
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _block_diag_mv_inverse(
+    inv: wp.array(dtype=Any),
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    z: wp.array(dtype=Any),
+    alpha: Any,
+    beta: Any,
+):
+    i = wp.tid()
+    zero = type(alpha)(0)
+    s = z.dtype(zero)
+    if alpha != zero:
+        s = alpha * (inv[i] * x[i])
+    if beta != zero:
+        s += beta * y[i]
+    z[i] = s
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _block_diag_mv_ldlt(
+    M: wp.array(dtype=Any),
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    z: wp.array(dtype=Any),
+    alpha: Any,
+    beta: Any,
+):
+    i = wp.tid()
+    zero = type(alpha)(0)
+    s = z.dtype(zero)
+    if alpha != zero:
+        s = alpha * _apply_ldlt(M[i], x[i])
+    if beta != zero:
+        s += beta * y[i]
+    z[i] = s
+
+
 @wp.kernel
 def _cg_kernel_1(
     tol: wp.array(dtype=Any),
@@ -2019,7 +2277,7 @@ def _bicgstab_kernel_3(
     p[i] = r[i] + beta * p[i] - beta_omega * v[i]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _gmres_solve_least_squares(
     k: int,
     pivot_tolerance: float,
@@ -2081,7 +2339,7 @@ def _gmres_solve_least_squares(
 
 @functools.cache
 def make_gmres_solve_least_squares_kernel_tiled(K: int):
-    @wp.kernel(module="unique")
+    @wp.kernel(module="unique", enable_backward=False)
     def gmres_solve_least_squares_tiled(
         k: int,
         pivot_tolerance: float,
@@ -2164,7 +2422,7 @@ def make_gmres_solve_least_squares_kernel_tiled(K: int):
     return gmres_solve_least_squares_tiled
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _gmres_arnoldi_axpy_kernel(
     j: int,
     V: wp.array2d(dtype=Any),
@@ -2187,7 +2445,7 @@ def _gmres_arnoldi_axpy_kernel(
     wp.tile_store(w, wi, offset=tid)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _gmres_arnoldi_normalize_kernel(
     x: wp.array(dtype=Any),
     y: wp.array(dtype=Any),
@@ -2201,11 +2459,15 @@ def _gmres_arnoldi_normalize_kernel(
     norm = wp.sqrt(a)
     y[tid] = wp.where(a == alpha.dtype(0.0), x[tid], x[tid] / norm)
 
-    if tid == batch_offsets[bid]:
+    if batch_offsets:
+        first_thread = batch_offsets[bid]
+    else:
+        first_thread = 0
+    if tid == first_thread:
         alpha_copy[bid] = norm
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _gmres_copy_hessenberg_column(
     j: int,
     src: wp.array2d(dtype=Any),
@@ -2216,7 +2478,7 @@ def _gmres_copy_hessenberg_column(
         H[bid, k, j] = src[k, bid]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _gmres_update_x_kernel(
     k: int,
     scale: Any,
