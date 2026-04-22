@@ -514,12 +514,6 @@ class LinearSolverState:
         self._device = self._A.device
         self._scalar_type = self._A.scalar_type
         self._batch_count = self._A.batch_count
-        # Sentinel offsets for single-batch case enable the same kernel code path for both cases
-        self._batch_offsets = (
-            self._A.batch_offsets
-            if self._A.batch_offsets is not None
-            else wp.array([0, self._A.shape[0]], dtype=int, device=self._device)
-        )
 
         if maxiter is None or maxiter == 0:
             maxiter = self._A.shape[0] // self._batch_count
@@ -617,7 +611,7 @@ class CG(LinearSolverState):
 
     def _run(self, A, b, x, M):
         device = self._device
-        batch_offsets = self._batch_offsets
+        batch_offsets = A.batch_offsets
         tiled_dot = self._tiled_dot
         p_and_Ap = self._p_and_Ap
         r_and_z_buf = self._r_and_z_buf
@@ -797,7 +791,7 @@ class CR(LinearSolverState):
 
     def _run(self, A, b, x, M):
         device = self._device
-        batch_offsets = self._batch_offsets
+        batch_offsets = A.batch_offsets
         tiled_dot = self._tiled_dot
         r_and_z_buf = self._r_and_z_buf
         y_and_Ap_buf = self._y_and_Ap_buf
@@ -1046,7 +1040,7 @@ class BiCGSTAB(LinearSolverState):
 
     def _run(self, A, b, x, M):
         device = self._device
-        batch_offsets = self._batch_offsets
+        batch_offsets = A.batch_offsets
         tiled_dot = self._tiled_dot
         is_left_preconditioner = self._is_left_preconditioner
 
@@ -1236,7 +1230,7 @@ class GMRES(LinearSolverState):
         is_left_preconditioner: whether ``M`` should be used as a left- or right- preconditioner.
 
     The preconditioner ``M`` may be freely changed (or toggled between ``None`` and a valid
-    operator) between calls. Batching is not supported.
+    operator) between calls.
     """
 
     def __init__(
@@ -1274,9 +1268,7 @@ class GMRES(LinearSolverState):
         b = self._b
         device = self._device
         scalar_dtype = self._scalar_type
-
-        if self._batch_count > 1:
-            raise NotImplementedError("GMRES does not support batching yet")
+        batch_count = self._batch_count
 
         # Cap restart at maxiter; align check_every with restart
         restart = min(self._restart, self._maxiter)
@@ -1289,17 +1281,23 @@ class GMRES(LinearSolverState):
         self._r = wp.empty_like(b)
         self._w = wp.empty_like(self._r)
 
-        self._H = wp.empty(shape=(restart + 1, restart), dtype=scalar_dtype, device=device)
-        self._y = wp.empty(shape=restart + 1, dtype=scalar_dtype, device=device)
+        # Per-batch Hessenberg + LS solution. Batch-major so H[bid] is a contiguous
+        # (restart+1, restart) slice usable by the LS kernels.
+        self._H = wp.empty(shape=(batch_count, restart + 1, restart), dtype=scalar_dtype, device=device)
+        self._y = wp.empty(shape=(batch_count, restart + 1), dtype=scalar_dtype, device=device)
 
         self._V = wp.zeros(shape=(restart + 1, self._r.shape[0]), dtype=self._r.dtype, device=device)
 
-        self._residuals = wp.empty(2, dtype=scalar_dtype, device=device)
-        self._beta = self._residuals[0:1]
-        self._atol_sq = self._residuals[1:2]
+        self._residuals = wp.empty((2, batch_count), dtype=scalar_dtype, device=device)
+        self._beta = self._residuals[0]
+        self._atol_sq = self._residuals[1]
 
         self._tiled_dot = TiledDot(
-            max_length=A.shape[0], device=device, scalar_type=scalar_dtype, max_column_count=restart + 1
+            max_length=A.shape[0],
+            device=device,
+            scalar_type=scalar_dtype,
+            max_column_count=restart + 1,
+            batch_offsets=A.batch_offsets,
         )
 
         w = self._w
@@ -1319,9 +1317,10 @@ class GMRES(LinearSolverState):
         self._tile_size = tile_size
 
         # recorded launches — all reference internal buffers, safe to reuse across calls
+        # Scalar LS uses a (batch, 1) grid; tiled LS uses (batch, tile_size) with one block per batch.
         self._least_squares_solve = wp.launch(
             least_squares_kernel,
-            dim=(1, tile_size),
+            dim=(batch_count, tile_size),
             block_dim=tile_size if tile_size > 1 else 256,
             device=device,
             inputs=[restart, self._pivot_tolerance, self._beta, self._H, self._y],
@@ -1332,7 +1331,7 @@ class GMRES(LinearSolverState):
             _gmres_arnoldi_normalize_kernel,
             dim=self._r.shape,
             device=self._r.device,
-            inputs=[self._r, self._w, self._tiled_dot.col(0), self._beta],
+            inputs=[self._r, self._w, self._tiled_dot.col(0), self._beta, A.batch_offsets],
             record_cmd=True,
         )
 
@@ -1341,7 +1340,18 @@ class GMRES(LinearSolverState):
             dim=(self._w.shape[0], tile_size),
             block_dim=tile_size,
             device=self._w.device,
-            inputs=[self._V, self._w, self._H],
+            inputs=[0, self._V, self._w, self._H, A.batch_offsets],
+            record_cmd=True,
+        )
+
+        # Transpose-copy of tiled_dot output (j+1, batch) into H[:, :j+1, j] (batch, j+1).
+        # Launched with a fixed grid of (restart+1, batch) so CUDA graphs see a stable
+        # launch size; the kernel guards against k >= k_count.
+        self._copy_hessenberg_col = wp.launch(
+            _gmres_copy_hessenberg_column,
+            dim=(restart + 1, batch_count),
+            device=device,
+            inputs=[0, self._tiled_dot.cols(restart + 1), self._H],
             record_cmd=True,
         )
 
@@ -1350,6 +1360,7 @@ class GMRES(LinearSolverState):
         scalar_dtype = self._scalar_type
         restart = self._restart
         is_left_preconditioner = self._is_left_preconditioner
+        batch_offsets = A.batch_offsets
 
         tiled_dot = self._tiled_dot
         r = self._r
@@ -1365,6 +1376,7 @@ class GMRES(LinearSolverState):
         least_squares_solve = self._least_squares_solve
         normalize_arnoldi_vec = self._normalize_arnoldi_vec
         arnoldi_axpy = self._arnoldi_axpy
+        copy_hessenberg_col = self._copy_hessenberg_col
 
         # Initialize tolerance from right-hand-side norm
         _initialize_absolute_tolerance(b, self._tol, self._atol, tiled_dot, atol_sq)
@@ -1374,12 +1386,6 @@ class GMRES(LinearSolverState):
 
         # Not strictly necessary, but makes it more robust to user-provided LinearOperators
         w.zero_()
-
-        def array_coeff(H, i, j):
-            return H[i][j : j + 1]
-
-        def array_col(H, j):
-            return H[: j + 1, j : j + 1]
 
         def do_arnoldi_iteration(j: int):
             # w = A * v[j];
@@ -1395,20 +1401,19 @@ class GMRES(LinearSolverState):
             else:
                 A.matvec(V[j], w, w, alpha=1, beta=0)
 
-            # compute and apply dot products in rappel,
-            # since Hj columns are orthogonal
-            Hj = array_col(H, j)
+            # compute and apply dot products in parallel,
+            # since the Hj column entries are independent per batch
             tiled_dot.compute(w_repeated, V[: j + 1])
-            wp.copy(src=tiled_dot.cols(j + 1), dest=Hj)
+            copy_hessenberg_col.set_param_at_index(0, j)
+            copy_hessenberg_col.launch()
 
-            # w -= w.vi vi
-            arnoldi_axpy.set_params([V[: j + 1], w, Hj])
+            # w -= sum_k H[:, k, j] * v[k]
+            arnoldi_axpy.set_param_at_index(0, j)
             arnoldi_axpy.launch()
 
-            # H[j+1, j] = |w.w|
+            # H[:, j+1, j] = ||w||; normalize w into v[j+1]
             tiled_dot.compute(w, w)
-            normalize_arnoldi_vec.set_params([w, V[j + 1], tiled_dot.col(0), array_coeff(H, j + 1, j)])
-
+            normalize_arnoldi_vec.set_params([w, V[j + 1], tiled_dot.col(0), H[:, j + 1, j], batch_offsets])
             normalize_arnoldi_vec.launch()
 
         def do_restart_cycle():
@@ -1421,8 +1426,8 @@ class GMRES(LinearSolverState):
             # beta^2 = rh.rh
             tiled_dot.compute(rh, rh)
 
-            # v[0] = r / beta
-            normalize_arnoldi_vec.set_params([rh, V[0], tiled_dot.col(0), beta])
+            # v[0] = rh / beta
+            normalize_arnoldi_vec.set_params([rh, V[0], tiled_dot.col(0), beta, batch_offsets])
             normalize_arnoldi_vec.launch()
 
             for j in range(restart):
@@ -1433,11 +1438,17 @@ class GMRES(LinearSolverState):
             # update x
             if M is None or is_left_preconditioner:
                 wp.launch(
-                    _gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(1.0), y, V, x]
+                    _gmres_update_x_kernel,
+                    dim=x.shape,
+                    device=device,
+                    inputs=[restart, scalar_dtype(1.0), y, V, x, batch_offsets],
                 )
             else:
                 wp.launch(
-                    _gmres_update_x_kernel, dim=x.shape, device=device, inputs=[restart, scalar_dtype(0.0), y, V, w]
+                    _gmres_update_x_kernel,
+                    dim=x.shape,
+                    device=device,
+                    inputs=[restart, scalar_dtype(0.0), y, V, w, batch_offsets],
                 )
                 M.matvec(w, x, x, alpha=1, beta=1)
 
@@ -2010,20 +2021,25 @@ def _bicgstab_kernel_3(
 
 @wp.kernel
 def _gmres_solve_least_squares(
-    k: int, pivot_tolerance: float, beta: wp.array(dtype=Any), H: wp.array2d(dtype=Any), y: wp.array(dtype=Any)
+    k: int,
+    pivot_tolerance: float,
+    beta: wp.array(dtype=Any),
+    H: wp.array3d(dtype=Any),
+    y: wp.array2d(dtype=Any),
 ):
-    # Solve H y = (beta, 0, ..., 0)
-    # H Hessenberg matrix of shape (k+1, k)
-    # so would not fit in registers
+    # Per-batch QR-by-Givens + back-solve of H y = (beta, 0, ..., 0).
+    # H is Hessenberg of shape (batch, k+1, k); one thread per batch.
 
-    rhs = beta[0]
+    bid, _lane = wp.tid()
+
+    rhs = beta[bid]
 
     # Apply 2x2 rotations to H so as to remove lower diagonal,
     # and apply similar rotations to right-hand-side
     max_k = int(k)
     for i in range(k):
-        Ha = H[i]
-        Hb = H[i + 1]
+        Ha = H[bid, i]
+        Hb = H[bid, i + 1]
 
         # Givens rotation [[c s], [-s c]]
         a = Ha[i]
@@ -2047,52 +2063,53 @@ def _gmres_solve_least_squares(
             Hb[j] = c * b - s * a
 
         # Rotate rhs
-        y[i] = c * rhs
+        y[bid, i] = c * rhs
         rhs = -s * rhs
 
     for i in range(max_k, k):
-        y[i] = y.dtype(0.0)
+        y[bid, i] = y.dtype(0.0)
 
     # Triangular back-solve for y
     for ii in range(max_k, 0, -1):
         i = ii - 1
-        Hi = H[i]
-        yi = y[i]
+        Hi = H[bid, i]
+        yi = y[bid, i]
         for j in range(ii, max_k):
-            yi -= Hi[j] * y[j]
-        y[i] = yi / Hi[i]
+            yi -= Hi[j] * y[bid, j]
+        y[bid, i] = yi / Hi[i]
 
 
 @functools.cache
 def make_gmres_solve_least_squares_kernel_tiled(K: int):
     @wp.kernel(module="unique")
     def gmres_solve_least_squares_tiled(
-        k: int, pivot_tolerance: float, beta: wp.array(dtype=Any), H: wp.array2d(dtype=Any), y: wp.array(dtype=Any)
+        k: int,
+        pivot_tolerance: float,
+        beta: wp.array(dtype=Any),
+        H: wp.array3d(dtype=Any),
+        y: wp.array2d(dtype=Any),
     ):
-        # Assumes tiles of size K, and K at least as large as highest number of columns
-        # Limits the max restart cycle length to the max block size of 1024, but using
-        # larger restarts would be very inefficient anyway (default is ~30)
+        # One CUDA block per batch, tile_size threads cooperate on that batch's LS.
+        # Assumes tiles of size K, and K at least as large as highest number of columns.
+        # Limits the max restart cycle length to the max block size of 1024.
+        #
+        # Solve H[bid] y[bid] = (beta[bid], 0, ..., 0) with H of shape (batch, k+1, k).
 
-        # Solve H y = (beta, 0, ..., 0)
-        # H Hessenberg matrix of shape (k+1, k)
+        bid, lane = wp.tid()
 
-        i, lane = wp.tid()
-
-        rhs = beta[0]
+        rhs = beta[bid]
 
         zero = H.dtype(0.0)
         one = H.dtype(1.0)
         yi = zero
 
-        Ha = wp.tile_load(H[0], shape=(K))
+        Ha = wp.tile_load(H[bid, 0], shape=(K))
 
         # Apply 2x2 rotations to H so as to remove lower diagonal,
         # and apply similar rotations to right-hand-side
         max_k = int(k)
         for i in range(k):
-            # Ha = H[i]
-            # Hb = H[i + 1]
-            Hb = wp.tile_load(H[i + 1], shape=(K))
+            Hb = wp.tile_load(H[bid, i + 1], shape=(K))
 
             # Givens rotation [[c s], [-s c]]
             a = Ha[i]
@@ -2119,7 +2136,7 @@ def make_gmres_solve_least_squares_kernel_tiled(K: int):
                 yi = c * rhs
             rhs = -s * rhs
 
-            wp.tile_store(H[i], wp.tile(a_rot))
+            wp.tile_store(H[bid, i], wp.tile(a_rot))
             Ha[lane] = b_rot
 
         y_tile = wp.tile(yi)
@@ -2128,7 +2145,7 @@ def make_gmres_solve_least_squares_kernel_tiled(K: int):
         for ii in range(max_k, 0, -1):
             i = ii - 1
 
-            Hi = wp.tile_load(H[i], shape=(K))
+            Hi = wp.tile_load(H[bid, i], shape=(K))
 
             il = lane + i
             if lane == 0:
@@ -2142,24 +2159,27 @@ def make_gmres_solve_least_squares_kernel_tiled(K: int):
             yit[0]  # no-op, movs yit to shared
             wp.tile_assign(y_tile, yit, offset=(i,))
 
-        wp.tile_store(y, y_tile)
+        wp.tile_store(y[bid], y_tile)
 
     return gmres_solve_least_squares_tiled
 
 
 @wp.kernel
 def _gmres_arnoldi_axpy_kernel(
+    j: int,
     V: wp.array2d(dtype=Any),
     w: wp.array(dtype=Any),
-    Vw: wp.array2d(dtype=Any),
+    H: wp.array3d(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     tid, lane = wp.tid()
+    bid = _find_batch(tid, batch_offsets)
 
-    s = w.dtype(Vw.dtype(0))
+    s = w.dtype(H.dtype(0))
 
     tile_size = wp.block_dim()
-    for k in range(lane, Vw.shape[0], tile_size):
-        s += Vw[k, 0] * V[k, tid]
+    for k in range(lane, j + 1, tile_size):
+        s += H[bid, k, j] * V[k, tid]
 
     wi = wp.tile_load(w, shape=1, offset=tid)
     wi -= wp.tile_sum(wp.tile(s, preserve_type=True))
@@ -2173,22 +2193,44 @@ def _gmres_arnoldi_normalize_kernel(
     y: wp.array(dtype=Any),
     alpha: wp.array(dtype=Any),
     alpha_copy: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
 ):
     tid = wp.tid()
-    norm = wp.sqrt(alpha[0])
-    y[tid] = wp.where(alpha[0] == alpha.dtype(0.0), x[tid], x[tid] / norm)
+    bid = _find_batch(tid, batch_offsets)
+    a = alpha[bid]
+    norm = wp.sqrt(a)
+    y[tid] = wp.where(a == alpha.dtype(0.0), x[tid], x[tid] / norm)
 
-    if tid == 0:
-        alpha_copy[0] = norm
+    if tid == batch_offsets[bid]:
+        alpha_copy[bid] = norm
 
 
 @wp.kernel
-def _gmres_update_x_kernel(k: int, beta: Any, y: wp.array(dtype=Any), V: wp.array2d(dtype=Any), x: wp.array(dtype=Any)):
-    tid = wp.tid()
+def _gmres_copy_hessenberg_column(
+    j: int,
+    src: wp.array2d(dtype=Any),
+    H: wp.array3d(dtype=Any),
+):
+    k, bid = wp.tid()
+    if k <= j:
+        H[bid, k, j] = src[k, bid]
 
-    xi = beta * x[tid]
+
+@wp.kernel
+def _gmres_update_x_kernel(
+    k: int,
+    scale: Any,
+    y: wp.array2d(dtype=Any),
+    V: wp.array2d(dtype=Any),
+    x: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    bid = _find_batch(tid, batch_offsets)
+
+    xi = scale * x[tid]
     for j in range(k):
-        xi += V[j, tid] * y[j]
+        xi += V[j, tid] * y[bid, j]
 
     x[tid] = xi
 
@@ -2199,6 +2241,7 @@ def _register_overloads():
     for dtype in (wp.float32, wp.float64):
         a = wp.array(dtype=dtype)
         a2 = wp.array2d(dtype=dtype)
+        a3 = wp.array3d(dtype=dtype)
 
         wp.overload(_initialize_tolerance, [dtype, dtype, a, a])
         wp.overload(_cg_kernel_1, {"tol": a, "resid": a, "rz_old": a, "p_Ap": a, "x": a, "r": a, "p": a, "Ap": a})
@@ -2213,10 +2256,11 @@ def _register_overloads():
         wp.overload(
             _bicgstab_kernel_3, {"tol": a, "resid": a, "rho_new": a, "r0v": a, "st": a, "tt": a, "p": a, "r": a, "v": a}
         )
-        wp.overload(_gmres_solve_least_squares, {"beta": a, "H": a2, "y": a})
-        wp.overload(_gmres_arnoldi_axpy_kernel, [a2, a, a2])
-        wp.overload(_gmres_arnoldi_normalize_kernel, [a, a, a, a])
-        wp.overload(_gmres_update_x_kernel, {"beta": dtype, "y": a, "V": a2, "x": a})
+        wp.overload(_gmres_solve_least_squares, {"beta": a, "H": a3, "y": a2})
+        wp.overload(_gmres_arnoldi_axpy_kernel, {"V": a2, "w": a, "H": a3})
+        wp.overload(_gmres_arnoldi_normalize_kernel, {"x": a, "y": a, "alpha": a, "alpha_copy": a})
+        wp.overload(_gmres_copy_hessenberg_column, {"src": a2, "H": a3})
+        wp.overload(_gmres_update_x_kernel, {"scale": dtype, "y": a2, "V": a2, "x": a})
 
 
 _register_overloads()

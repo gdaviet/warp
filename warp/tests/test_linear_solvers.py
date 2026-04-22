@@ -300,6 +300,64 @@ def test_batched_nonuniform(test, device, dtype=wp.float32):
     _check_batch_residuals(test, A_np_full, b_np_full, batch_sizes, x_full, 1e-5, dtype)
 
 
+def _run_batched_gmres(test, device, dtype, batch_sizes, seed_base, tol, restart):
+    rows = sum(batch_sizes)
+    A_np_full = np.zeros((rows, rows), dtype=np.float64 if dtype == wp.float64 else np.float32)
+    b_np_full = np.zeros(rows, dtype=A_np_full.dtype)
+
+    for i, n in enumerate(batch_sizes):
+        A_i, b_i = _make_nonsymmetric_system(n, seed=seed_base + i, dtype=dtype, device="cpu")
+        offset = sum(batch_sizes[:i])
+        sl = slice(offset, offset + n)
+        A_np_full[sl, sl] = A_i.numpy()
+        b_np_full[sl] = b_i.numpy()
+
+    A_full = wp.array(A_np_full, dtype=dtype, device=device)
+    b_full = wp.array(b_np_full, dtype=dtype, device=device)
+
+    offsets = _batch_offsets(batch_sizes, device)
+    A_op = aslinearoperator(A_full, batch_offsets=offsets)
+    test.assertEqual(A_op.batch_count, len(batch_sizes))
+
+    # Diagonal preconditioner (block-diagonal across the full system, so implicitly per-batch).
+    M = preconditioner(A_full, "diag")
+
+    # (description, kwargs) pairs — no precond, right precond, left precond
+    cases = [
+        ("none", {}),
+        ("right", {"M": M}),
+        ("left", {"M": M, "is_left_preconditioner": True}),
+    ]
+    for _label, kwargs in cases:
+        x_full = wp.zeros_like(b_full)
+        gmres(A_op, b_full, x_full, tol=tol, restart=restart, maxiter=1000, **kwargs)
+        _check_batch_residuals(test, A_np_full, b_np_full, batch_sizes, x_full, tol, dtype)
+
+
+def test_batched_gmres(test, device, dtype=wp.float32, batch_count=4, n=20):
+    _run_batched_gmres(
+        test,
+        device,
+        dtype,
+        batch_sizes=[n] * batch_count,
+        seed_base=456,
+        tol=1e-3 if dtype == wp.float32 else 1e-5,
+        restart=16,
+    )
+
+
+def test_batched_gmres_nonuniform(test, device, dtype=wp.float32):
+    _run_batched_gmres(
+        test,
+        device,
+        dtype,
+        batch_sizes=[8, 15, 10, 12],
+        seed_base=654,
+        tol=1e-3 if dtype == wp.float32 else 1e-5,
+        restart=16,
+    )
+
+
 def test_functor_reuse(test, device):
     # For each solver, construct a pre-allocated functor, then re-run on a different
     # (but compatible) system without re-allocating temporary buffers.
@@ -391,6 +449,9 @@ add_function_test(TestLinearSolvers, "test_batched_cg_f32", test_batched_cg, dev
 add_function_test(TestLinearSolvers, "test_batched_cg_f64", test_batched_cg, devices=devices, dtype=wp.float64)
 add_function_test(TestLinearSolvers, "test_batched_cr_f32", test_batched_cr, devices=devices)
 add_function_test(TestLinearSolvers, "test_batched_bicgstab_f32", test_batched_bicgstab, devices=devices)
+add_function_test(TestLinearSolvers, "test_batched_gmres_f32", test_batched_gmres, devices=devices)
+add_function_test(TestLinearSolvers, "test_batched_gmres_f64", test_batched_gmres, devices=devices, dtype=wp.float64)
+add_function_test(TestLinearSolvers, "test_batched_gmres_nonuniform", test_batched_gmres_nonuniform, devices=devices)
 add_function_test(TestLinearSolvers, "test_batched_nonuniform", test_batched_nonuniform, devices=devices)
 add_function_test(TestLinearSolvers, "test_functor_reuse", test_functor_reuse, devices=devices)
 add_function_test(TestLinearSolvers, "test_functor_preconditioner", test_functor_preconditioner, devices=devices)
