@@ -7,11 +7,13 @@ import unittest
 import numpy as np
 
 import warp as wp
+from warp._src.sparse import _bsr_block_index_active, _bsr_row_index_active
 from warp.sparse import (
     BsrMatrix,
     bsr_assign,
     bsr_axpy,
     bsr_axpy_work_arrays,
+    bsr_compress,
     bsr_copy,
     bsr_diag,
     bsr_from_triplets,
@@ -25,6 +27,7 @@ from warp.sparse import (
     bsr_set_transpose,
     bsr_set_zero,
     bsr_transposed,
+    bsr_validate,
     bsr_zeros,
 )
 from warp.tests.unittest_utils import *
@@ -55,8 +58,8 @@ def _bsr_pruned(bsr):
         rows_of_blocks=bsr.nrow,
         cols_of_blocks=bsr.ncol,
         rows=bsr.uncompress_rows(),
-        columns=bsr.columns,
-        values=bsr.values,
+        columns=bsr.columns[: bsr.nnz],
+        values=bsr.values[: bsr.nnz],
         prune_numerical_zeros=True,
     )
 
@@ -65,18 +68,42 @@ def _bsr_to_dense(bsr):
     mat = np.zeros(bsr.shape)
 
     offsets = bsr.offsets.numpy()
+    row_ends = bsr.row_ends.numpy()
     columns = bsr.columns.numpy()
     values = bsr.values.numpy()
 
     for row in range(bsr.nrow):
         beg = offsets[row]
-        end = offsets[row + 1]
+        end = row_ends[row]
 
         for block in range(beg, end):
             mat_block = _get_block(mat, row, columns[block], bsr.block_shape)
             mat_block += values[block]
 
     return mat
+
+
+def _make_gapped_csr(device):
+    bsr = bsr_zeros(2, 3, float, device=device)
+    bsr.nnz = 6
+    bsr.offsets = wp.array([0, 3, 6], dtype=int, device=device)
+    bsr.row_ends = wp.array([2, 5], dtype=int, device=device)
+    bsr.columns = wp.array([0, 2, -1, 1, 2, -1], dtype=int, device=device)
+    bsr.values = wp.array([1.0, 2.0, 100.0, 3.0, 4.0, 200.0], dtype=float, device=device)
+    return bsr
+
+
+@wp.kernel
+def _gapped_lookup_kernel(
+    offsets: wp.array(dtype=int),
+    row_ends: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    out: wp.array(dtype=int),
+):
+    out[0] = _bsr_block_index_active(0, 2, offsets, columns, row_ends)
+    out[1] = _bsr_block_index_active(0, 1, offsets, columns, row_ends)
+    out[2] = _bsr_row_index_active(offsets, 2, 2, row_ends)
+    out[3] = _bsr_row_index_active(offsets, 2, 4, row_ends)
 
 
 def test_csr_from_triplets(test, device):
@@ -166,6 +193,545 @@ def test_bsr_from_triplets_prune_numerical_zeros(test, device):
         prune_numerical_zeros=True,
     )
     assert A.nnz_sync() == 0
+
+
+def test_bsr_gapped_layout(test, device):
+    A = _make_gapped_csr(device)
+
+    test.assertTrue(bsr_validate(A, require_slack_sentinel=True))
+    np.testing.assert_array_equal(A.uncompress_rows().numpy(), np.array([0, 0, -1, 1, 1, -1]))
+    assert_np_equal(_bsr_to_dense(A), np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 4.0]]))
+
+    active_slack = _make_gapped_csr(device)
+    active_slack.row_ends = wp.array([3, 5], dtype=int, device=device)
+    with test.assertRaisesRegex(ValueError, "active column"):
+        bsr_validate(active_slack)
+    test.assertFalse(bsr_validate(active_slack, raise_on_error=False))
+
+    bad_row_end = _make_gapped_csr(device)
+    bad_row_end.row_ends = wp.array([4, 5], dtype=int, device=device)
+    with test.assertRaisesRegex(ValueError, "row_ends"):
+        bsr_validate(bad_row_end)
+
+    bad_slack = _make_gapped_csr(device)
+    bad_slack.columns = wp.array([0, 2, 1, 1, 2, -1], dtype=int, device=device)
+    with test.assertRaisesRegex(ValueError, "slack column"):
+        bsr_validate(bad_slack, require_slack_sentinel=True)
+
+    masked_triplets = _make_gapped_csr(device)
+    masked_triplets.columns = wp.array([0, 2, 1, 1, 2, 0], dtype=int, device=device)
+    bsr_set_from_triplets(
+        masked_triplets,
+        rows=wp.array([0, 0, 1, 0], dtype=int, device=device),
+        columns=wp.array([1, 2, 0, 2], dtype=int, device=device),
+        values=wp.array([9.0, 5.0, 8.0, 7.0], dtype=float, device=device),
+        masked=True,
+    )
+    np.testing.assert_array_equal(masked_triplets.row_ends.numpy(), np.array([2, 5]))
+    np.testing.assert_array_equal(masked_triplets.columns.numpy(), np.array([0, 2, 1, 1, 2, 0]))
+    assert_np_equal(_bsr_to_dense(masked_triplets), np.array([[0.0, 0.0, 12.0], [0.0, 0.0, 0.0]]))
+
+    duplicate_compact = bsr_from_triplets(
+        1,
+        1,
+        rows=wp.array([0, 0], dtype=int, device=device),
+        columns=wp.array([0, 0], dtype=int, device=device),
+        values=wp.array([1.0, 2.0], dtype=float, device=device),
+    )
+    test.assertEqual(duplicate_compact.nnz, 2)
+    test.assertTrue(bsr_validate(duplicate_compact, require_compact=True))
+
+    lookup = wp.empty(4, dtype=int, device=device)
+    wp.launch(_gapped_lookup_kernel, dim=1, device=device, inputs=[A.offsets, A.row_ends, A.columns, lookup])
+    np.testing.assert_array_equal(lookup.numpy(), np.array([1, -1, -1, 1]))
+
+    x = wp.array([5.0, 7.0, 11.0], dtype=float, device=device)
+    y = bsr_mv(A, x)
+    assert_np_equal(y.numpy(), np.array([27.0, 65.0]))
+
+    xt = wp.array([13.0, 17.0], dtype=float, device=device)
+    yt = bsr_mv(A, xt, transpose=True)
+    assert_np_equal(yt.numpy(), np.array([13.0, 51.0, 94.0]))
+
+    diag = bsr_get_diag(A)
+    assert_np_equal(diag.numpy(), np.array([1.0, 3.0]))
+
+    X = bsr_from_triplets(
+        2,
+        3,
+        wp.array([0, 0, 1, 1], dtype=int, device=device),
+        wp.array([0, 2, 1, 2], dtype=int, device=device),
+        wp.array([10.0, 20.0, 30.0, 40.0], dtype=float, device=device),
+    )
+    bsr_axpy(X, A, alpha=1.0, beta=1.0, masked=True)
+    assert_np_equal(_bsr_to_dense(A), np.array([[11.0, 0.0, 22.0], [0.0, 33.0, 44.0]]))
+    np.testing.assert_array_equal(A.uncompress_rows().numpy(), np.array([0, 0, -1, 1, 1, -1]))
+
+    B = bsr_zeros(3, 2, float, device=device)
+    B.nnz = 6
+    B.offsets = wp.array([0, 2, 4, 6], dtype=int, device=device)
+    B.row_ends = wp.array([1, 3, 5], dtype=int, device=device)
+    B.columns = wp.array([0, -1, 1, -1, 0, -1], dtype=int, device=device)
+    B.values = wp.array([5.0, 100.0, 7.0, 100.0, 11.0, 100.0], dtype=float, device=device)
+    product = bsr_mm(A, B)
+    assert_np_equal(_bsr_to_dense(product), np.array([[297.0, 0.0], [484.0, 231.0]]))
+    np.testing.assert_array_equal(product.row_ends.numpy(), product.offsets.numpy()[1:])
+
+    padded_mm_z = bsr_zeros(2, 2, float, device=device)
+    padded_mm_z.nnz = 4
+    padded_mm_z.offsets = wp.array([0, 2, 4], dtype=int, device=device)
+    padded_mm_z.row_ends = wp.array([1, 3], dtype=int, device=device)
+    padded_mm_z.columns = wp.array([1, -1, 0, -1], dtype=int, device=device)
+    padded_mm_z.values = wp.array([2.0, -9.0, 3.0, -9.0], dtype=float, device=device)
+    bsr_mm(A, B, padded_mm_z, alpha=2.0, beta=3.0, topology="padded")
+    np.testing.assert_array_equal(padded_mm_z.offsets.numpy(), np.array([0, 2, 4]))
+    np.testing.assert_array_equal(padded_mm_z.row_ends.numpy(), np.array([2, 4]))
+    np.testing.assert_array_equal(padded_mm_z.columns.numpy(), np.array([0, 1, 0, 1]))
+    assert_np_equal(_bsr_to_dense(padded_mm_z), np.array([[594.0, 6.0], [977.0, 462.0]]))
+
+    too_small_mm = bsr_zeros(2, 2, float, device=device)
+    too_small_mm.nnz = 2
+    too_small_mm.offsets = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_mm.row_ends = wp.array([0, 1], dtype=int, device=device)
+    too_small_mm.columns = wp.full(2, value=-1, dtype=int, device=device)
+    too_small_mm.values = wp.zeros(2, dtype=float, device=device)
+    with test.assertRaisesRegex(RuntimeError, "row capacity"):
+        bsr_mm(A, B, too_small_mm, alpha=1.0, beta=0.0, topology="padded")
+
+    padded_mm_work = bsr_mm_work_arrays()
+    padded_mm_status_z = bsr_zeros(2, 2, float, device=device)
+    padded_mm_status_z.nnz = 4
+    padded_mm_status_z.offsets = wp.array([0, 2, 4], dtype=int, device=device)
+    padded_mm_status_z.row_ends = wp.array([0, 2], dtype=int, device=device)
+    padded_mm_status_z.columns = wp.full(4, value=-1, dtype=int, device=device)
+    padded_mm_status_z.values = wp.zeros(4, dtype=float, device=device)
+    bsr_mm(A, B, padded_mm_status_z, alpha=1.0, beta=0.0, topology="padded", work_arrays=padded_mm_work)
+    test.assertEqual(padded_mm_work.status_sync(), 0)
+    np.testing.assert_array_equal(padded_mm_status_z.row_ends.numpy(), np.array([1, 4]))
+    np.testing.assert_array_equal(padded_mm_status_z.columns.numpy(), np.array([0, -1, 0, 1]))
+    assert_np_equal(_bsr_to_dense(padded_mm_status_z), np.array([[297.0, 0.0], [484.0, 231.0]]))
+
+    bsr_mm(A, B, padded_mm_status_z, alpha=0.0, beta=2.0, topology="padded", work_arrays=padded_mm_work)
+    np.testing.assert_array_equal(padded_mm_status_z.row_ends.numpy(), np.array([1, 4]))
+    assert_np_equal(_bsr_to_dense(padded_mm_status_z), np.array([[594.0, 0.0], [968.0, 462.0]]))
+
+    right_diag = bsr_from_triplets(
+        2,
+        2,
+        rows=wp.array([0, 1], dtype=int, device=device),
+        columns=wp.array([0, 1], dtype=int, device=device),
+        values=wp.array([3.0, 4.0], dtype=float, device=device),
+    )
+    alias_x = bsr_zeros(2, 2, float, device=device)
+    alias_x.nnz = 4
+    alias_x.offsets = wp.array([0, 2, 4], dtype=int, device=device)
+    alias_x.row_ends = wp.array([1, 3], dtype=int, device=device)
+    alias_x.columns = wp.array([0, -1, 1, -1], dtype=int, device=device)
+    alias_x.values = wp.array([1.0, 0.0, 2.0, 0.0], dtype=float, device=device)
+    bsr_mm(alias_x, right_diag, alias_x, alpha=1.0, beta=1.0, topology="padded")
+    np.testing.assert_array_equal(alias_x.row_ends.numpy(), np.array([1, 3]))
+    np.testing.assert_array_equal(alias_x.columns.numpy(), np.array([0, -1, 1, -1]))
+    assert_np_equal(_bsr_to_dense(alias_x), np.array([[4.0, 0.0], [0.0, 10.0]]))
+
+    left_diag = bsr_from_triplets(
+        2,
+        2,
+        rows=wp.array([0, 1], dtype=int, device=device),
+        columns=wp.array([0, 1], dtype=int, device=device),
+        values=wp.array([3.0, 4.0], dtype=float, device=device),
+    )
+    alias_y = bsr_zeros(2, 2, float, device=device)
+    alias_y.nnz = 4
+    alias_y.offsets = wp.array([0, 2, 4], dtype=int, device=device)
+    alias_y.row_ends = wp.array([1, 3], dtype=int, device=device)
+    alias_y.columns = wp.array([0, -1, 1, -1], dtype=int, device=device)
+    alias_y.values = wp.array([1.0, 0.0, 2.0, 0.0], dtype=float, device=device)
+    bsr_mm(left_diag, alias_y, alias_y, alpha=1.0, beta=1.0, topology="padded")
+    np.testing.assert_array_equal(alias_y.row_ends.numpy(), np.array([1, 3]))
+    np.testing.assert_array_equal(alias_y.columns.numpy(), np.array([0, -1, 1, -1]))
+    assert_np_equal(_bsr_to_dense(alias_y), np.array([[4.0, 0.0], [0.0, 10.0]]))
+
+    too_small_mm_status = bsr_zeros(2, 2, float, device=device)
+    too_small_mm_status.nnz = 2
+    too_small_mm_status.offsets = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_mm_status.row_ends = wp.array([0, 1], dtype=int, device=device)
+    too_small_mm_status.columns = wp.full(2, value=-1, dtype=int, device=device)
+    too_small_mm_status.values = wp.zeros(2, dtype=float, device=device)
+    bsr_mm(
+        A,
+        B,
+        too_small_mm_status,
+        alpha=1.0,
+        beta=0.0,
+        topology="padded",
+        overflow="ignore",
+        work_arrays=padded_mm_work,
+    )
+    test.assertEqual(padded_mm_work.status_sync(), 1)
+    test.assertEqual(padded_mm_work.status_message(), "row capacity exceeded")
+    np.testing.assert_array_equal(too_small_mm_status.row_ends.numpy(), np.array([1, 1]))
+
+    padded_dest = bsr_zeros(2, 3, float, device=device)
+    padded_dest.nnz = 7
+    padded_dest.offsets = wp.array([0, 4, 7], dtype=int, device=device)
+    padded_dest.row_ends = wp.array([0, 4], dtype=int, device=device)
+    padded_dest.columns = wp.full(7, value=-9, dtype=int, device=device)
+    padded_dest.values = wp.full(7, value=-9.0, dtype=float, device=device)
+
+    bsr_assign(padded_dest, A, topology="padded")
+    np.testing.assert_array_equal(padded_dest.offsets.numpy(), np.array([0, 4, 7]))
+    np.testing.assert_array_equal(padded_dest.row_ends.numpy(), np.array([2, 6]))
+    np.testing.assert_array_equal(padded_dest.columns.numpy(), np.array([0, 2, -1, -1, 1, 2, -1]))
+    assert_np_equal(_bsr_to_dense(padded_dest), _bsr_to_dense(A))
+
+    padded_dest64 = bsr_zeros(2, 3, wp.float64, device=device)
+    padded_dest64.nnz = 7
+    padded_dest64.offsets = wp.array([0, 4, 7], dtype=int, device=device)
+    padded_dest64.row_ends = wp.array([0, 4], dtype=int, device=device)
+    padded_dest64.columns = wp.full(7, value=-1, dtype=int, device=device)
+    padded_dest64.values = wp.zeros(7, dtype=wp.float64, device=device)
+    bsr_assign(padded_dest64, A, topology="padded")
+    np.testing.assert_array_equal(padded_dest64.offsets.numpy(), np.array([0, 4, 7]))
+    np.testing.assert_array_equal(padded_dest64.row_ends.numpy(), np.array([2, 6]))
+    np.testing.assert_array_equal(padded_dest64.columns.numpy(), np.array([0, 2, -1, -1, 1, 2, -1]))
+    assert_np_equal(_bsr_to_dense(padded_dest64), _bsr_to_dense(A))
+
+    padded_copy = bsr_copy(2.0 * A, topology="padded")
+    np.testing.assert_array_equal(padded_copy.offsets.numpy(), A.offsets.numpy())
+    np.testing.assert_array_equal(padded_copy.row_ends.numpy(), A.row_ends.numpy())
+    np.testing.assert_array_equal(padded_copy.columns.numpy(), A.columns.numpy())
+    assert_np_equal(_bsr_to_dense(padded_copy), 2.0 * _bsr_to_dense(A))
+
+    padded_copy64 = bsr_copy(A, scalar_type=wp.float64, topology="padded")
+    np.testing.assert_array_equal(padded_copy64.offsets.numpy(), A.offsets.numpy())
+    np.testing.assert_array_equal(padded_copy64.row_ends.numpy(), A.row_ends.numpy())
+    np.testing.assert_array_equal(padded_copy64.columns.numpy(), A.columns.numpy())
+    assert_np_equal(_bsr_to_dense(padded_copy64), _bsr_to_dense(A))
+
+    block_src = bsr_zeros(1, 2, wp.mat22, device=device)
+    block_src.nnz = 3
+    block_src.offsets = wp.array([0, 3], dtype=int, device=device)
+    block_src.row_ends = wp.array([2], dtype=int, device=device)
+    block_src.columns = wp.array([0, 1, -1], dtype=int, device=device)
+    block_src.values = wp.array(
+        np.array(
+            [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]], [[-1.0, -1.0], [-1.0, -1.0]]],
+            dtype=np.float32,
+        ),
+        dtype=wp.mat22,
+        device=device,
+    )
+    split_dest = bsr_zeros(2, 4, float, device=device)
+    split_dest.nnz = 8
+    split_dest.offsets = wp.array([0, 4, 8], dtype=int, device=device)
+    split_dest.row_ends = wp.array([0, 4], dtype=int, device=device)
+    split_dest.columns = wp.full(8, value=-1, dtype=int, device=device)
+    split_dest.values = wp.zeros(8, dtype=float, device=device)
+    bsr_assign(split_dest, block_src, topology="padded")
+    np.testing.assert_array_equal(split_dest.offsets.numpy(), np.array([0, 4, 8]))
+    np.testing.assert_array_equal(split_dest.row_ends.numpy(), np.array([4, 8]))
+    np.testing.assert_array_equal(split_dest.columns.numpy(), np.array([0, 1, 2, 3, 0, 1, 2, 3]))
+    assert_np_equal(_bsr_to_dense(split_dest), np.array([[1.0, 2.0, 5.0, 6.0], [3.0, 4.0, 7.0, 8.0]]))
+
+    split_copy = bsr_copy(block_src, block_shape=(1, 1), topology="padded")
+    np.testing.assert_array_equal(split_copy.offsets.numpy(), np.array([0, 6, 12]))
+    np.testing.assert_array_equal(split_copy.row_ends.numpy(), np.array([4, 10]))
+    np.testing.assert_array_equal(split_copy.columns.numpy(), np.array([0, 1, 2, 3, -1, -1, 0, 1, 2, 3, -1, -1]))
+    assert_np_equal(_bsr_to_dense(split_copy), np.array([[1.0, 2.0, 5.0, 6.0], [3.0, 4.0, 7.0, 8.0]]))
+    test.assertTrue(bsr_validate(split_copy, require_slack_sentinel=True))
+
+    too_small = bsr_zeros(2, 3, float, device=device)
+    too_small.nnz = 2
+    too_small.offsets = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small.row_ends = wp.array([0, 1], dtype=int, device=device)
+    too_small.columns = wp.full(2, value=-1, dtype=int, device=device)
+    too_small.values = wp.zeros(2, dtype=float, device=device)
+    with test.assertRaisesRegex(RuntimeError, "row capacity"):
+        bsr_assign(too_small, A, topology="padded")
+
+    assign_status = wp.zeros(1, dtype=int, device=device)
+    assign_status_dest = bsr_zeros(2, 3, float, device=device)
+    assign_status_dest.nnz = 7
+    assign_status_dest.offsets = wp.array([0, 4, 7], dtype=int, device=device)
+    assign_status_dest.row_ends = wp.array([0, 4], dtype=int, device=device)
+    assign_status_dest.columns = wp.full(7, value=-1, dtype=int, device=device)
+    assign_status_dest.values = wp.zeros(7, dtype=float, device=device)
+    bsr_assign(assign_status_dest, A, topology="padded", overflow="ignore", status=assign_status)
+    test.assertEqual(int(assign_status.numpy()[0]), 0)
+    assert_np_equal(_bsr_to_dense(assign_status_dest), _bsr_to_dense(A))
+
+    too_small_assign_status = bsr_zeros(2, 3, float, device=device)
+    too_small_assign_status.nnz = 2
+    too_small_assign_status.offsets = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_assign_status.row_ends = wp.array([0, 1], dtype=int, device=device)
+    too_small_assign_status.columns = wp.full(2, value=-1, dtype=int, device=device)
+    too_small_assign_status.values = wp.zeros(2, dtype=float, device=device)
+    bsr_assign(too_small_assign_status, A, topology="padded", overflow="ignore", status=assign_status)
+    test.assertEqual(int(assign_status.numpy()[0]), 1)
+
+    too_small_split_status = bsr_zeros(2, 4, float, device=device)
+    too_small_split_status.nnz = 4
+    too_small_split_status.offsets = wp.array([0, 2, 4], dtype=int, device=device)
+    too_small_split_status.row_ends = wp.array([0, 2], dtype=int, device=device)
+    too_small_split_status.columns = wp.full(4, value=-1, dtype=int, device=device)
+    too_small_split_status.values = wp.zeros(4, dtype=float, device=device)
+    bsr_assign(too_small_split_status, block_src, topology="padded", overflow="ignore", status=assign_status)
+    test.assertEqual(int(assign_status.numpy()[0]), 1)
+
+    padded_axpy_y = _make_gapped_csr(device)
+    padded_axpy_x = bsr_from_triplets(
+        2,
+        3,
+        rows=wp.array([0, 1, 1], dtype=int, device=device),
+        columns=wp.array([1, 0, 2], dtype=int, device=device),
+        values=wp.array([5.0, 7.0, 11.0], dtype=float, device=device),
+    )
+    bsr_axpy(padded_axpy_x, padded_axpy_y, alpha=2.0, beta=3.0, topology="padded")
+    np.testing.assert_array_equal(padded_axpy_y.offsets.numpy(), np.array([0, 3, 6]))
+    np.testing.assert_array_equal(padded_axpy_y.row_ends.numpy(), np.array([3, 6]))
+    np.testing.assert_array_equal(padded_axpy_y.columns.numpy(), np.array([0, 1, 2, 0, 1, 2]))
+    assert_np_equal(_bsr_to_dense(padded_axpy_y), np.array([[3.0, 10.0, 6.0], [14.0, 9.0, 34.0]]))
+
+    padded_axpy_work = bsr_axpy_work_arrays()
+    padded_axpy_status_y = _make_gapped_csr(device)
+    bsr_axpy(
+        padded_axpy_x,
+        padded_axpy_status_y,
+        alpha=2.0,
+        beta=3.0,
+        topology="padded",
+        work_arrays=padded_axpy_work,
+    )
+    test.assertEqual(padded_axpy_work.status_sync(), 0)
+    np.testing.assert_array_equal(padded_axpy_status_y.row_ends.numpy(), np.array([3, 6]))
+    assert_np_equal(_bsr_to_dense(padded_axpy_status_y), np.array([[3.0, 10.0, 6.0], [14.0, 9.0, 34.0]]))
+
+    too_small_axpy_status = bsr_zeros(2, 3, float, device=device)
+    too_small_axpy_status.nnz = 2
+    too_small_axpy_status.offsets = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_axpy_status.row_ends = wp.array([1, 2], dtype=int, device=device)
+    too_small_axpy_status.columns = wp.array([0, 1], dtype=int, device=device)
+    too_small_axpy_status.values = wp.zeros(2, dtype=float, device=device)
+    bsr_axpy(
+        padded_axpy_x,
+        too_small_axpy_status,
+        alpha=1.0,
+        beta=1.0,
+        topology="padded",
+        overflow="ignore",
+        work_arrays=padded_axpy_work,
+    )
+    test.assertEqual(padded_axpy_work.status_sync(), 1)
+    test.assertEqual(padded_axpy_work.status_message(), "row capacity exceeded")
+    np.testing.assert_array_equal(too_small_axpy_status.row_ends.numpy(), np.array([0, 1]))
+
+    with test.assertRaisesRegex(RuntimeError, "row capacity"):
+        bsr_axpy(padded_axpy_x, too_small, alpha=1.0, beta=0.0, topology="padded")
+
+    compact_transpose = bsr_transposed(A)
+    np.testing.assert_array_equal(compact_transpose.row_ends.numpy(), compact_transpose.offsets.numpy()[1:])
+    assert_np_equal(_bsr_to_dense(compact_transpose), np.array([[11.0, 0.0], [0.0, 33.0], [22.0, 44.0]]))
+
+    transpose_dest = bsr_zeros(3, 2, float, device=device)
+    transpose_dest.nnz = 7
+    transpose_dest.offsets = wp.array([0, 2, 4, 7], dtype=int, device=device)
+    transpose_dest.row_ends = wp.array([0, 2, 4], dtype=int, device=device)
+    transpose_dest.columns = wp.full(7, value=-9, dtype=int, device=device)
+    transpose_dest.values = wp.full(7, value=-9.0, dtype=float, device=device)
+    bsr_set_transpose(transpose_dest, 2.0 * A, topology="padded")
+    np.testing.assert_array_equal(transpose_dest.offsets.numpy(), np.array([0, 2, 4, 7]))
+    np.testing.assert_array_equal(transpose_dest.row_ends.numpy(), np.array([1, 3, 6]))
+    np.testing.assert_array_equal(transpose_dest.columns.numpy(), np.array([0, -1, 1, -1, 0, 1, -1]))
+    assert_np_equal(_bsr_to_dense(transpose_dest), np.array([[22.0, 0.0], [0.0, 66.0], [44.0, 88.0]]))
+
+    too_small_transpose = bsr_zeros(3, 2, float, device=device)
+    too_small_transpose.nnz = 3
+    too_small_transpose.offsets = wp.array([0, 1, 2, 3], dtype=int, device=device)
+    too_small_transpose.row_ends = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_transpose.columns = wp.full(3, value=-1, dtype=int, device=device)
+    too_small_transpose.values = wp.zeros(3, dtype=float, device=device)
+    with test.assertRaisesRegex(RuntimeError, "row capacity"):
+        bsr_set_transpose(too_small_transpose, A, topology="padded")
+
+    transpose_status = wp.zeros(1, dtype=int, device=device)
+    transpose_status_dest = bsr_zeros(3, 2, float, device=device)
+    transpose_status_dest.nnz = 7
+    transpose_status_dest.offsets = wp.array([0, 2, 4, 7], dtype=int, device=device)
+    transpose_status_dest.row_ends = wp.array([0, 2, 4], dtype=int, device=device)
+    transpose_status_dest.columns = wp.full(7, value=-1, dtype=int, device=device)
+    transpose_status_dest.values = wp.zeros(7, dtype=float, device=device)
+    bsr_set_transpose(
+        transpose_status_dest,
+        A,
+        topology="padded",
+        overflow="ignore",
+        status=transpose_status,
+    )
+    test.assertEqual(int(transpose_status.numpy()[0]), 0)
+    np.testing.assert_array_equal(transpose_status_dest.row_ends.numpy(), np.array([1, 3, 6]))
+    assert_np_equal(_bsr_to_dense(transpose_status_dest), np.array([[11.0, 0.0], [0.0, 33.0], [22.0, 44.0]]))
+
+    too_small_transpose_status = bsr_zeros(3, 2, float, device=device)
+    too_small_transpose_status.nnz = 3
+    too_small_transpose_status.offsets = wp.array([0, 1, 2, 3], dtype=int, device=device)
+    too_small_transpose_status.row_ends = wp.array([0, 1, 2], dtype=int, device=device)
+    too_small_transpose_status.columns = wp.full(3, value=-1, dtype=int, device=device)
+    too_small_transpose_status.values = wp.zeros(3, dtype=float, device=device)
+    bsr_set_transpose(
+        too_small_transpose_status,
+        A,
+        topology="padded",
+        overflow="ignore",
+        status=transpose_status,
+    )
+    test.assertEqual(int(transpose_status.numpy()[0]), 1)
+    np.testing.assert_array_equal(too_small_transpose_status.row_ends.numpy(), np.array([1, 2, 2]))
+
+    triplet_dest = bsr_zeros(2, 3, float, device=device)
+    triplet_dest.nnz = 5
+    triplet_dest.offsets = wp.array([0, 2, 5], dtype=int, device=device)
+    triplet_dest.row_ends = wp.array([0, 2], dtype=int, device=device)
+    triplet_dest.columns = wp.full(5, value=-9, dtype=int, device=device)
+    triplet_dest.values = wp.full(5, value=-9.0, dtype=float, device=device)
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([1, 0, 1, 0, 1], dtype=int, device=device),
+        columns=wp.array([2, 1, 2, 0, 1], dtype=int, device=device),
+        values=wp.array([4.0, 1.0, 5.0, 2.0, 3.0], dtype=float, device=device),
+        topology="padded",
+    )
+    np.testing.assert_array_equal(triplet_dest.offsets.numpy(), np.array([0, 2, 5]))
+    np.testing.assert_array_equal(triplet_dest.row_ends.numpy(), np.array([2, 4]))
+    np.testing.assert_array_equal(triplet_dest.columns.numpy(), np.array([0, 1, 1, 2, -1]))
+    assert_np_equal(_bsr_to_dense(triplet_dest), np.array([[2.0, 1.0, 0.0], [0.0, 3.0, 9.0]]))
+
+    triplet_status = wp.zeros(1, dtype=int, device=device)
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([1, 0, 1, 0, 1], dtype=int, device=device),
+        columns=wp.array([2, 1, 2, 0, 1], dtype=int, device=device),
+        values=wp.array([4.0, 1.0, 5.0, 2.0, 3.0], dtype=float, device=device),
+        topology="padded",
+        overflow="ignore",
+        status=triplet_status,
+    )
+    test.assertEqual(int(triplet_status.numpy()[0]), 0)
+
+    triplet_count = wp.array([3], dtype=int, device=device)
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([1, 0, 1, 0, 1], dtype=int, device=device),
+        columns=wp.array([2, 1, 2, 0, 1], dtype=int, device=device),
+        values=wp.array([4.0, 1.0, 5.0, 2.0, 3.0], dtype=float, device=device),
+        count=triplet_count,
+        topology="padded",
+    )
+    np.testing.assert_array_equal(triplet_dest.row_ends.numpy(), np.array([1, 3]))
+    np.testing.assert_array_equal(triplet_dest.columns.numpy(), np.array([1, -1, 2, -1, -1]))
+    assert_np_equal(_bsr_to_dense(triplet_dest), np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 9.0]]))
+
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([0, 0, 0, 1], dtype=int, device=device),
+        columns=wp.array([0, 0, 1, 1], dtype=int, device=device),
+        values=wp.array([1.0, -1.0, 2.0, 0.0], dtype=float, device=device),
+        topology="padded",
+    )
+    np.testing.assert_array_equal(triplet_dest.row_ends.numpy(), np.array([1, 2]))
+    np.testing.assert_array_equal(triplet_dest.columns.numpy(), np.array([1, -1, -1, -1, -1]))
+    assert_np_equal(_bsr_to_dense(triplet_dest), np.array([[0.0, 2.0, 0.0], [0.0, 0.0, 0.0]]))
+
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([1, 0, 1, 0], dtype=int, device=device),
+        columns=wp.array([2, 1, 2, 0], dtype=int, device=device),
+        topology="padded",
+    )
+    np.testing.assert_array_equal(triplet_dest.row_ends.numpy(), np.array([2, 3]))
+    np.testing.assert_array_equal(triplet_dest.columns.numpy(), np.array([0, 1, 2, -1, -1]))
+    test.assertTrue(bsr_validate(triplet_dest, require_slack_sentinel=True))
+
+    with test.assertRaisesRegex(RuntimeError, "row capacity"):
+        bsr_set_from_triplets(
+            too_small,
+            rows=wp.array([0, 0, 1], dtype=int, device=device),
+            columns=wp.array([0, 2, 1], dtype=int, device=device),
+            values=wp.array([1.0, 2.0, 3.0], dtype=float, device=device),
+            topology="padded",
+        )
+
+    bsr_set_from_triplets(
+        too_small,
+        rows=wp.array([0, 0, 1], dtype=int, device=device),
+        columns=wp.array([0, 2, 1], dtype=int, device=device),
+        values=wp.array([1.0, 2.0, 3.0], dtype=float, device=device),
+        topology="padded",
+        overflow="ignore",
+        status=triplet_status,
+    )
+    test.assertEqual(int(triplet_status.numpy()[0]), 1)
+
+    bsr_set_from_triplets(
+        triplet_dest,
+        rows=wp.array([], dtype=int, device=device),
+        columns=wp.array([], dtype=int, device=device),
+        values=wp.array([], dtype=float, device=device),
+        topology="padded",
+    )
+    np.testing.assert_array_equal(triplet_dest.offsets.numpy(), np.array([0, 2, 5]))
+    np.testing.assert_array_equal(triplet_dest.row_ends.numpy(), np.array([0, 2]))
+    np.testing.assert_array_equal(triplet_dest.columns.numpy(), np.full(5, -1))
+
+    compact = bsr_compress(A)
+    test.assertEqual(compact.nnz_sync(), 4)
+    np.testing.assert_array_equal(compact.row_ends.numpy(), compact.offsets.numpy()[1:])
+    assert_np_equal(_bsr_to_dense(compact), _bsr_to_dense(A))
+
+    candidate = bsr_zeros(2, 3, float, device=device)
+    candidate.nnz = 7
+    candidate.offsets = wp.array([0, 4, 7], dtype=int, device=device)
+    candidate.row_ends = wp.array([4, 7], dtype=int, device=device)
+    candidate.columns = wp.array([2, 0, 2, 1, 1, 2, 1], dtype=int, device=device)
+    candidate.values = wp.array([5.0, 2.0, -1.0, 3.0, 4.0, 8.0, -4.0], dtype=float, device=device)
+    test.assertTrue(bsr_validate(candidate, require_sorted=False, require_unique=False))
+    with test.assertRaisesRegex(ValueError, "sorted"):
+        bsr_validate(candidate)
+    compressed_candidate = bsr_compress(candidate, inplace=True)
+    test.assertIs(compressed_candidate, candidate)
+    test.assertTrue(bsr_validate(candidate, require_slack_sentinel=True))
+    np.testing.assert_array_equal(candidate.offsets.numpy(), np.array([0, 4, 7]))
+    np.testing.assert_array_equal(candidate.row_ends.numpy(), np.array([3, 5]))
+    np.testing.assert_array_equal(candidate.columns.numpy(), np.array([0, 1, 2, -1, 2, -1, -1]))
+    assert_np_equal(_bsr_to_dense(candidate), np.array([[2.0, 3.0, 4.0], [0.0, 0.0, 8.0]]))
+
+    block_candidate = bsr_zeros(1, 3, wp.mat22, device=device)
+    block_candidate.nnz = 4
+    block_candidate.offsets = wp.array([0, 4], dtype=int, device=device)
+    block_candidate.row_ends = wp.array([4], dtype=int, device=device)
+    block_candidate.columns = wp.array([2, 0, 2, 1], dtype=int, device=device)
+    block_values = np.array(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [7.0, 8.0]],
+            [[-1.0, -2.0], [-3.0, -4.0]],
+            [[9.0, 10.0], [11.0, 12.0]],
+        ],
+        dtype=np.float32,
+    )
+    block_candidate.values = wp.array(block_values, dtype=wp.mat22, device=device)
+    bsr_compress(block_candidate, inplace=True)
+    np.testing.assert_array_equal(block_candidate.row_ends.numpy(), np.array([2]))
+    np.testing.assert_array_equal(block_candidate.columns.numpy(), np.array([0, 1, -1, -1]))
+    expected_block_dense = np.zeros((2, 6))
+    expected_block_dense[:, 0:2] = block_values[1]
+    expected_block_dense[:, 2:4] = block_values[3]
+    assert_np_equal(_bsr_to_dense(block_candidate), expected_block_dense)
+
+    bsr_set_zero(A, topology="padded")
+    np.testing.assert_array_equal(A.offsets.numpy(), np.array([0, 3, 6]))
+    np.testing.assert_array_equal(A.row_ends.numpy(), np.array([0, 3]))
+    np.testing.assert_array_equal(A.columns.numpy()[: A.nnz], np.full(A.nnz, -1))
+    assert_np_equal(_bsr_to_dense(A), np.zeros((2, 3)))
 
 
 def test_bsr_from_triplets_gradient(test, device):
@@ -833,6 +1399,7 @@ add_function_test(
     test_bsr_from_triplets_prune_numerical_zeros,
     devices=devices,
 )
+add_function_test(TestSparse, "test_bsr_gapped_layout", test_bsr_gapped_layout, devices=devices)
 add_function_test(TestSparse, "test_bsr_get_diag", test_bsr_get_set_diag, devices=devices)
 add_function_test(TestSparse, "test_bsr_split_merge", test_bsr_split_merge, devices=devices)
 add_function_test(TestSparse, "test_bsr_assign_masked", test_bsr_assign_masked, devices=devices)

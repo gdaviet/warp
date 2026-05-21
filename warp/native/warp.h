@@ -350,6 +350,7 @@ WP_API void wp_bsr_matrix_from_triplets_host(
     int* summed_block_offsets,
     int* summed_block_indices,
     int* bsr_offsets,
+    const int* bsr_row_ends,
     int* bsr_columns,
     int* bsr_nnz,
     void* bsr_nnz_event
@@ -369,6 +370,7 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     int* summed_block_offsets,
     int* summed_block_indices,
     int* bsr_offsets,
+    const int* bsr_row_ends,
     int* bsr_columns,
     int* bsr_nnz,
     void* bsr_nnz_event
@@ -379,6 +381,7 @@ WP_API void wp_bsr_transpose_host(
     int col_count,
     int nnz,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* transposed_bsr_offsets,
     int* transposed_bsr_columns,
@@ -389,6 +392,7 @@ WP_API void wp_bsr_transpose_device(
     int col_count,
     int nnz,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* transposed_bsr_offsets,
     int* transposed_bsr_columns,

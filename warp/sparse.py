@@ -30,6 +30,7 @@ from warp._src.sparse import bsr_assign as bsr_assign
 from warp._src.sparse import bsr_axpy as bsr_axpy
 from warp._src.sparse import bsr_block_index as bsr_block_index
 from warp._src.sparse import bsr_copy as bsr_copy
+from warp._src.sparse import bsr_compress as bsr_compress
 from warp._src.sparse import bsr_diag as bsr_diag
 from warp._src.sparse import bsr_from_triplets as bsr_from_triplets
 from warp._src.sparse import bsr_get_diag as bsr_get_diag
@@ -45,4 +46,5 @@ from warp._src.sparse import bsr_set_identity as bsr_set_identity
 from warp._src.sparse import bsr_set_transpose as bsr_set_transpose
 from warp._src.sparse import bsr_set_zero as bsr_set_zero
 from warp._src.sparse import bsr_transposed as bsr_transposed
+from warp._src.sparse import bsr_validate as bsr_validate
 from warp._src.sparse import bsr_zeros as bsr_zeros

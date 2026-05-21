@@ -68,6 +68,7 @@ struct BsrBlockInMask {
     const int nrow;
     const int ncol;
     const int* bsr_offsets;
+    const int* bsr_row_ends;
     const int* bsr_columns;
     const int* device_nnz;
 
@@ -84,7 +85,7 @@ struct BsrBlockInMask {
             return true;
 
         int lower = bsr_offsets[row];
-        int upper = bsr_offsets[row + 1] - 1;
+        int upper = (bsr_row_ends != nullptr ? bsr_row_ends[row] : bsr_offsets[row + 1]) - 1;
 
         while (lower < upper) {
             const int mid = lower + (upper - lower) / 2;
@@ -194,6 +195,7 @@ __global__ void bsr_transpose_fill_row_col(
     const int nnz_upper_bound,
     const int row_count,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* block_indices,
     BsrRowCol* transposed_row_col
@@ -229,9 +231,24 @@ __global__ void bsr_transpose_fill_row_col(
     }
 
     const int row = lower;
+    if (i >= bsr_row_ends[row]) {
+        transposed_row_col[i] = PRUNED_ROWCOL;
+        return;
+    }
+
     const int col = bsr_columns[i];
     BsrRowCol row_col = bsr_combine_row_col(col, row);
     transposed_row_col[i] = row_col;
+}
+
+__global__ void
+bsr_count_active_blocks(const int row_count, const int* bsr_offsets, const int* bsr_row_ends, int* active_count)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= row_count)
+        return;
+
+    atomicAdd(active_count, bsr_row_ends[row] - bsr_offsets[row]);
 }
 
 }  // namespace
@@ -252,6 +269,7 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     int* tpl_block_offsets,
     int* tpl_block_indices,
     int* bsr_offsets,
+    const int* bsr_row_ends,
     int* bsr_columns,
     int* bsr_nnz,
     void* bsr_nnz_event
@@ -278,7 +296,14 @@ WP_API void wp_bsr_matrix_from_triplets_device(
 
     // Combine rows and columns so we can sort on them both,
     // ensuring that blocks that should be pruned are moved to the end
-    BsrBlockInMask mask { row_count, col_count, masked_topology ? bsr_offsets : nullptr, bsr_columns, tpl_nnz };
+    BsrBlockInMask mask {
+        row_count,
+        col_count,
+        masked_topology ? bsr_offsets : nullptr,
+        masked_topology ? bsr_row_ends : nullptr,
+        bsr_columns,
+        tpl_nnz,
+    };
     if (scalar_zero_mask == 0 || tpl_values == nullptr)
         scalar_size = 0;
     switch (scalar_size) {
@@ -395,6 +420,7 @@ WP_API void wp_bsr_transpose_device(
     int col_count,
     int nnz,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* transposed_bsr_offsets,
     int* transposed_bsr_columns,
@@ -407,13 +433,19 @@ WP_API void wp_bsr_transpose_device(
     cudaStream_t stream = static_cast<cudaStream_t>(wp_cuda_stream_get_current());
 
     ScopedTemporary<BsrRowCol> combined_row_col(context, 2 * nnz);
+    ScopedTemporary<int> active_count(context, 1);
+    check_cuda(cudaMemsetAsync(active_count.buffer(), 0, sizeof(int), stream));
 
     cub::DoubleBuffer<int> d_keys(src_block_indices + nnz, src_block_indices);
     cub::DoubleBuffer<BsrRowCol> d_values(combined_row_col.buffer(), combined_row_col.buffer() + nnz);
 
     wp_launch_device(
+        WP_CURRENT_CONTEXT, bsr_count_active_blocks, row_count, (row_count, bsr_offsets, bsr_row_ends, active_count.buffer())
+    );
+
+    wp_launch_device(
         WP_CURRENT_CONTEXT, bsr_transpose_fill_row_col, nnz,
-        (nnz, row_count, bsr_offsets, bsr_columns, d_keys.Current(), d_values.Current())
+        (nnz, row_count, bsr_offsets, bsr_row_ends, bsr_columns, d_keys.Current(), d_values.Current())
     );
 
     // Sort blocks
@@ -435,11 +467,11 @@ WP_API void wp_bsr_transpose_device(
     // Compute row offsets from sorted unique blocks
     wp_launch_device(
         WP_CURRENT_CONTEXT, bsr_find_row_offsets, col_count + 1,
-        (col_count, bsr_offsets + row_count, d_values.Current(), transposed_bsr_offsets)
+        (col_count, active_count.buffer(), d_values.Current(), transposed_bsr_offsets)
     );
 
 
     wp_launch_device(
-        WP_CURRENT_CONTEXT, bsr_set_column, nnz, (bsr_offsets + row_count, d_values.Current(), transposed_bsr_columns)
+        WP_CURRENT_CONTEXT, bsr_set_column, nnz, (active_count.buffer(), d_values.Current(), transposed_bsr_columns)
     );
 }

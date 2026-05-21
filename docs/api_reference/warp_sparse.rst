@@ -19,6 +19,7 @@ API
    bsr_assign
    bsr_axpy
    bsr_block_index
+   bsr_compress
    bsr_copy
    bsr_diag
    bsr_from_triplets
@@ -35,4 +36,5 @@ API
    bsr_set_transpose
    bsr_set_zero
    bsr_transposed
+   bsr_validate
    bsr_zeros

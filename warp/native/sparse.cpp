@@ -37,6 +37,7 @@ WP_API void wp_bsr_matrix_from_triplets_host(
     int* tpl_block_offsets,
     int* tpl_block_indices,
     int* bsr_offsets,
+    const int* bsr_row_ends,
     int* bsr_columns,
     int* bsr_nnz,
     void* bsr_nnz_event
@@ -68,7 +69,7 @@ WP_API void wp_bsr_matrix_from_triplets_host(
         }
 
         const int* beg = bsr_columns + bsr_offsets[row];
-        const int* end = bsr_columns + bsr_offsets[row + 1];
+        const int* end = bsr_columns + (bsr_row_ends != nullptr ? bsr_row_ends[row] : bsr_offsets[row + 1]);
         const int* block = std::lower_bound(beg, end, col);
         return block == end || *block != col;
     };
@@ -164,31 +165,36 @@ WP_API void wp_bsr_transpose_host(
     int col_count,
     int nnz,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* transposed_bsr_offsets,
     int* transposed_bsr_columns,
     int* block_indices
 )
 {
-    nnz = bsr_offsets[row_count];
+    const int capacity = std::min(nnz, bsr_offsets[row_count]);
 
-    std::vector<int> bsr_rows(nnz);
-    std::iota(block_indices, block_indices + nnz, 0);
+    std::vector<int> bsr_rows(capacity);
 
-    // Fill row indices from offsets
+    // Fill row indices from active row ranges only.
+    int active_nnz = 0;
     for (int row = 0; row < row_count; ++row) {
-        std::fill(bsr_rows.begin() + bsr_offsets[row], bsr_rows.begin() + bsr_offsets[row + 1], row);
+        const int row_end = std::min(bsr_row_ends[row], bsr_offsets[row + 1]);
+        for (int block = bsr_offsets[row]; block < row_end; ++block) {
+            block_indices[active_nnz++] = block;
+            bsr_rows[block] = row;
+        }
     }
 
     // sort block indices according to (transposed) lexico order
-    std::sort(block_indices, block_indices + nnz, [&bsr_rows, bsr_columns](int i, int j) -> bool {
+    std::sort(block_indices, block_indices + active_nnz, [&bsr_rows, bsr_columns](int i, int j) -> bool {
         return bsr_columns[i] < bsr_columns[j] || (bsr_columns[i] == bsr_columns[j] && bsr_rows[i] < bsr_rows[j]);
     });
 
     // Count blocks per column and transpose blocks
     std::fill_n(transposed_bsr_offsets, col_count + 1, 0);
 
-    for (int i = 0; i < nnz; ++i) {
+    for (int i = 0; i < active_nnz; ++i) {
         int idx = block_indices[i];
         int row = bsr_rows[idx];
         int col = bsr_columns[idx];
@@ -199,6 +205,8 @@ WP_API void wp_bsr_transpose_host(
 
     // build postfix sum of column counts
     std::partial_sum(transposed_bsr_offsets, transposed_bsr_offsets + col_count + 1, transposed_bsr_offsets);
+
+    std::fill(transposed_bsr_columns + active_nnz, transposed_bsr_columns + nnz, -1);
 }
 
 #if !WP_ENABLE_CUDA
@@ -217,6 +225,7 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     int* summed_block_offsets,
     int* summed_block_indices,
     int* bsr_offsets,
+    const int* bsr_row_ends,
     int* bsr_columns,
     int* bsr_nnz,
     void* bsr_nnz_event
@@ -230,6 +239,7 @@ WP_API void wp_bsr_transpose_device(
     int col_count,
     int nnz,
     const int* bsr_offsets,
+    const int* bsr_row_ends,
     const int* bsr_columns,
     int* transposed_bsr_offsets,
     int* transposed_bsr_columns,

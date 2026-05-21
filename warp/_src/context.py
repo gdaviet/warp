@@ -5415,10 +5415,11 @@ class Runtime:
                 ctypes.c_void_p,  # tpl_values
                 ctypes.c_uint64,  # zero_value_mask
                 ctypes.c_bool,  # masked
-                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
-                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # prefix sum of block count to sum for each bsr block
                 ctypes.POINTER(ctypes.c_int),  # indices to ptriplet blocks to sum for each bsr block
+                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # bsr_row_ends
+                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # bsr_nnz
                 ctypes.c_void_p,  # bsr_nnz_event
             ]
@@ -5430,8 +5431,9 @@ class Runtime:
                 ctypes.c_int,  # row_count
                 ctypes.c_int,  # col count
                 ctypes.c_int,  # nnz
-                ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
-                ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
+                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # bsr_row_ends
+                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # src to dest block map

@@ -109,8 +109,8 @@ Non-Zero Block Count
 ~~~~~~~~~~~~~~~~~~~~
 
 The number of non-zero blocks in a BSR matrix is computed on the device and not automatically synchronized to the host to avoid performance overhead and allow graph capture. 
-The :attr:`BsrMatrix.nnz` attribute of a BSR matrix is always an upper bound for the number of non-zero blocks,
-but the actual count is stored on the device at ``offsets[nrow]``.
+The :attr:`BsrMatrix.nnz` attribute of a BSR matrix is always an upper bound for the stored block array size.
+For compact matrices, the actual active count is stored on the device at ``offsets[nrow]``.
 
 To get the exact count on host, you can explicitly synchronize using :meth:`BsrMatrix.nnz_sync`:
 
@@ -132,6 +132,86 @@ To get the exact count on host, you can explicitly synchronize using :meth:`BsrM
 
 If the number of non-zeros has been changed from outside of the :mod:`warp.sparse` builtin functions, for instance by direct modifications to the offsets array, use the :meth:`BsrMatrix.notify_nnz_changed` method to ensure consistency.
 
+Row Capacity and Padded Topology
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, sparse constructors and topology-changing operations produce compact BSR/CSR matrices. In a compact matrix, row ``r`` stores its active blocks in ``offsets[r]:offsets[r + 1]``.
+
+Warp also supports matrices with reserved row capacity. These matrices use ``row_ends`` to mark the active end of each row:
+
+.. code-block:: text
+
+    offsets[row]      : row_ends[row]      active blocks
+    row_ends[row]     : offsets[row + 1]  slack capacity
+    offsets[row]      : offsets[row + 1]  total row capacity
+
+The required invariant is:
+
+.. code-block:: text
+
+    offsets[row] <= row_ends[row] <= offsets[row + 1]
+
+For compact matrices, ``row_ends`` is equal to ``offsets[1:]``. For padded matrices, :attr:`BsrMatrix.nnz` remains the storage upper bound, not necessarily the active block count. Slack entries are ignored by sparse operations. Warp-managed operations mark slack columns as ``-1`` where practical, but kernels use ``row_ends`` as the source of truth for active entries.
+
+Use :func:`bsr_validate` to check row-capacity invariants around user-provided buffers or tests:
+
+.. code-block:: python
+
+    from warp.sparse import bsr_validate
+
+    bsr_validate(A, require_slack_sentinel=True)
+
+Operations that may change topology accept a ``topology`` policy where supported:
+
+.. code-block:: text
+
+    compact  rebuild compact topology, discarding row padding
+    masked   keep the current active topology and update values only
+    cached   reuse cached topology data from previous work arrays
+    padded   write into existing per-row capacity
+
+The ``"compact"`` policy is the default for builders and unmasked arithmetic. The ``"padded"`` policy is an allocation contract: each destination row must already have enough capacity for the result.
+
+For example, a compact source can be copied into an already padded destination:
+
+.. code-block:: python
+
+    from warp.sparse import bsr_assign, bsr_set_zero
+
+    bsr_set_zero(dest, topology="padded")       # keep row capacity, clear active rows
+    bsr_assign(dest=dest, src=src, topology="padded")
+
+Padded topology-changing operations use an overflow policy. With ``overflow="error"``, the operation raises if any destination row lacks capacity. With ``overflow="ignore"``, the caller supplies status storage and can synchronize explicitly:
+
+.. code-block:: python
+
+    import warp as wp
+    from warp.sparse import bsr_axpy, bsr_axpy_work_arrays
+
+    work = bsr_axpy_work_arrays()
+    bsr_axpy(x, y, topology="padded", overflow="ignore", work_arrays=work)
+    if work.status_sync() != 0:
+        raise RuntimeError(work.status_message())
+
+Functions such as :func:`bsr_assign`, :func:`bsr_set_from_triplets`, and :func:`bsr_set_transpose` accept a single-element ``status`` array for the same purpose:
+
+.. code-block:: python
+
+    from warp.sparse import bsr_set_transpose
+
+    status = wp.zeros(shape=(1,), dtype=wp.int32, device=dest.device)
+    bsr_set_transpose(dest, src, topology="padded", overflow="ignore", status=status)
+
+Row-ordered candidate entries can be compressed with :func:`bsr_compress`. With ``inplace=True``, entries in each active row range are sorted, duplicate columns are accumulated, optional numerical zero blocks are pruned, and ``row_ends`` is updated in place:
+
+.. code-block:: python
+
+    from warp.sparse import bsr_compress
+
+    bsr_compress(A, inplace=True)
+
+With ``inplace=False``, :func:`bsr_compress` produces a compact matrix. This is the recommended way to export a compact representation from a padded matrix.
+
 Converting back to COO Format
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -151,6 +231,18 @@ You can convert a BSR matrix back to coordinate (COO) format using the matrix's 
     # - rows[i] is the row index of block i
     # - cols[i] is the column index of block i
     # - vals[i] is the value of block i
+
+For matrices with row padding, :meth:`BsrMatrix.uncompress_rows` returns an array sized to :attr:`BsrMatrix.nnz` and uses ``-1`` for slack entries. Use :func:`bsr_compress` first when a compact COO export is required:
+
+.. code-block:: python
+
+    from warp.sparse import bsr_compress
+
+    compact = bsr_compress(A, inplace=False)
+    nnz = compact.nnz_sync()
+    rows = compact.uncompress_rows()[:nnz]
+    cols = compact.columns[:nnz]
+    vals = compact.values[:nnz]
 
 
 Matrix Operations

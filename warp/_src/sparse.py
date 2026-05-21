@@ -37,6 +37,7 @@ __all__ = [
     "bsr_axpy",
     "bsr_block_index",
     "bsr_copy",
+    "bsr_compress",
     "bsr_diag",
     "bsr_from_triplets",
     "bsr_get_diag",
@@ -53,6 +54,7 @@ __all__ = [
     "bsr_set_transpose",
     "bsr_set_zero",
     "bsr_transposed",
+    "bsr_validate",
     "bsr_zeros",
 ]
 
@@ -75,6 +77,9 @@ BlockType = _MatrixBlockType[Rows, Cols, Scalar] | _ScalarBlockType[Scalar]
 _struct_cache = {}
 _transfer_buffer_cache = {}
 
+_BSR_STATUS_SUCCESS = 0
+_BSR_STATUS_ROW_CAPACITY_EXCEEDED = 1
+
 
 class BsrMatrix(Generic[_BlockType]):
     """Untyped base class for BSR and CSR matrices.
@@ -84,12 +89,16 @@ class BsrMatrix(Generic[_BlockType]):
     Attributes:
         nrow (int): Number of rows of blocks.
         ncol (int): Number of columns of blocks.
-        nnz (int):  Upper bound for the number of non-zero blocks, used for
-          dimensioning launches. The exact number is at ``offsets[nrow-1]``.
-          See also :meth:`nnz_sync`.
+        nnz (int):  Upper bound for the number of stored blocks, used for
+          dimensioning launches. For compact matrices this is also the number
+          of active non-zero blocks. See also :meth:`nnz_sync`.
         offsets (Array[int]): Array of size at least ``1 + nrow`` such that the
-          start and end indices of the blocks of row ``r`` are ``offsets[r]``
-          and ``offsets[r+1]``, respectively.
+          start and capacity end indices of row ``r`` are ``offsets[r]`` and
+          ``offsets[r+1]``, respectively.
+        row_ends (Array[int]): Array of size at least ``nrow`` containing the
+          active end index of each row. Active blocks of row ``r`` are stored in
+          ``offsets[r]:row_ends[r]``. For compact matrices, ``row_ends[r]`` is
+          equal to ``offsets[r+1]``.
         columns (Array[int]): Array of size at least equal to ``nnz`` containing
           block column indices.
         values (Array[BlockType]): Array of size at least equal to ``nnz``
@@ -124,7 +133,7 @@ class BsrMatrix(Generic[_BlockType]):
 
     @property
     def device(self) -> wp._src.context.Device:
-        """Device on which ``offsets``, ``columns``, and ``values`` are allocated -- assumed to be the same for all three arrays."""
+        """Device on which matrix arrays are allocated."""
         return self.values.device
 
     @property
@@ -148,7 +157,7 @@ class BsrMatrix(Generic[_BlockType]):
             kernel=_bsr_get_block_row,
             device=self.device,
             dim=self.nnz,
-            inputs=[self.nrow, self.offsets, out],
+            inputs=[self.nrow, self.offsets, self.row_ends, out],
         )
         return out
 
@@ -319,6 +328,8 @@ def bsr_matrix_t(dtype: BlockType):
         """Upper bound for the number of non-zeros."""
         offsets: wp.array(dtype=int)
         """Array of size at least ``1 + nrow``."""
+        row_ends: wp.array(dtype=int)
+        """Array of size at least ``nrow``."""
         columns: wp.array(dtype=int)
         """Array of size at least equal to ``nnz``."""
         values: wp.array(dtype=dtype)
@@ -368,6 +379,7 @@ def bsr_zeros(
     bsr.columns = wp.empty(shape=(0,), dtype=int, device=device)
     bsr.values = wp.empty(shape=(0,), dtype=block_type, device=device)
     bsr.offsets = wp.zeros(shape=(bsr.nrow + 1,), dtype=int, device=device)
+    bsr.row_ends = wp.zeros(shape=(bsr.nrow,), dtype=int, device=device)
 
     return bsr
 
@@ -380,6 +392,13 @@ def _bsr_resize(bsr: BsrMatrix, rows_of_blocks: int | None = None, cols_of_block
 
     if bsr.offsets.size < bsr.nrow + 1:
         bsr.offsets = wp.empty(shape=(bsr.nrow + 1,), dtype=int, device=bsr.offsets.device)
+    if bsr.row_ends.size < bsr.nrow:
+        bsr.row_ends = wp.empty(shape=(bsr.nrow,), dtype=int, device=bsr.offsets.device)
+
+
+def _bsr_set_compact_row_ends(bsr: BsrMatrix) -> None:
+    if bsr.nrow > 0:
+        wp.copy(dest=bsr.row_ends, src=bsr.offsets, src_offset=1, count=bsr.nrow)
 
 
 def _bsr_ensure_fits(bsr: BsrMatrix, nnz: int | None = None) -> None:
@@ -397,17 +416,46 @@ def _bsr_ensure_fits(bsr: BsrMatrix, nnz: int | None = None) -> None:
         )
 
 
-def bsr_set_zero(bsr: BsrMatrix, rows_of_blocks: int | None = None, cols_of_blocks: int | None = None):
+def bsr_set_zero(
+    bsr: BsrMatrix,
+    rows_of_blocks: int | None = None,
+    cols_of_blocks: int | None = None,
+    topology: str = "compact",
+):
     """Set a BSR matrix to zero, possibly changing its size.
 
     Args:
         bsr: The BSR or CSR matrix to set to zero.
         rows_of_blocks: If not ``None``, the new number of rows of blocks.
         cols_of_blocks: If not ``None``, the new number of columns of blocks.
+        topology: Topology policy. ``"compact"`` discards the active and
+          capacity topology, ``"padded"`` keeps row capacity and makes every
+          row empty, and ``"masked"`` keeps active topology and zeroes values.
     """
+    if topology not in ("compact", "padded", "masked"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+
+    if topology == "masked":
+        if rows_of_blocks is not None or cols_of_blocks is not None:
+            raise ValueError("Cannot resize a matrix with topology='masked'")
+        bsr.values.zero_()
+        return
+
+    if topology == "padded" and (rows_of_blocks is not None or cols_of_blocks is not None):
+        raise ValueError("Cannot resize a matrix with topology='padded'")
+
     _bsr_resize(bsr, rows_of_blocks, cols_of_blocks)
 
+    if topology == "padded":
+        if bsr.nrow > 0:
+            wp.copy(dest=bsr.row_ends, src=bsr.offsets, count=bsr.nrow)
+        if bsr.nnz > 0:
+            bsr.columns.fill_(-1)
+            bsr.values.zero_()
+        return
+
     bsr.offsets.zero_()
+    bsr.row_ends.zero_()
     bsr.notify_nnz_changed(nnz=0)
 
 
@@ -430,6 +478,61 @@ def _optional_ctypes_event(event: wp.Event | None):
     return None if event is None else event.cuda_event
 
 
+def _bsr_status_message(status: int) -> str:
+    if status == _BSR_STATUS_SUCCESS:
+        return "success"
+    if status == _BSR_STATUS_ROW_CAPACITY_EXCEEDED:
+        return "row capacity exceeded"
+    return f"unknown status {status}"
+
+
+def _bsr_raise_if_status_error(status: wp.array):
+    status_code = int(status.numpy()[0])
+    if status_code == _BSR_STATUS_ROW_CAPACITY_EXCEEDED:
+        raise RuntimeError("Destination row capacity is insufficient for topology='padded'")
+    if status_code != _BSR_STATUS_SUCCESS:
+        raise RuntimeError(_bsr_status_message(status_code))
+
+
+def _bsr_validate_status_array(status: wp.array, device):
+    if status.device != device:
+        raise ValueError(f"Status and sparse matrix must reside on the same device, got {status.device} and {device}")
+    if status.shape != (1,):
+        raise ValueError(f"Status array must be a single-element array, got {status.shape}")
+    if status.dtype != wp.int32:
+        raise TypeError("Status array must be of type int32")
+
+
+class _BsrStatusMixin:
+    def _reset_status(self):
+        self._status = None
+
+    def _ensure_status(self, device):
+        if self._status is None or self._status.device != device:
+            self._status = wp.zeros(shape=(1,), dtype=int, device=device)
+        else:
+            self._status.zero_()
+
+        return self._status
+
+    def status_sync(self) -> int:
+        """Return the last asynchronous sparse status code, synchronizing if needed."""
+
+        if self._status is None:
+            return _BSR_STATUS_SUCCESS
+
+        return int(self._status.numpy()[0])
+
+    def status_message(self) -> str:
+        """Return a human-readable message for :meth:`status_sync`."""
+
+        return _bsr_status_message(self.status_sync())
+
+
+def _bsr_temp_status(device):
+    return wp.zeros(shape=(1,), dtype=int, device=device)
+
+
 _zero_value_masks = {
     wp.float16: 0x7FFF,
     wp.bfloat16: 0x7FFF,
@@ -440,6 +543,87 @@ _zero_value_masks = {
     wp.int32: 0xFFFFFFFF,
     wp.int64: 0xFFFFFFFFFFFFFFFF,
 }
+
+
+def make_bsr_compress_inplace_rows(block_rows: int, block_cols: int):
+    from warp._src.fem.cache import dynamic_kernel  # noqa: PLC0415
+
+    @dynamic_kernel(suffix=(block_rows, block_cols), kernel_options={"enable_backward": False})
+    def bsr_compress_inplace_rows(
+        prune_numerical_zeros: bool,
+        offsets: wp.array(dtype=int),
+        row_ends: wp.array(dtype=int),
+        columns: wp.array(dtype=int),
+        values: wp.array3d(dtype=Any),
+    ):
+        row = wp.tid()
+
+        row_beg = offsets[row]
+        row_end = row_ends[row]
+
+        # Sort the row-local candidate range by column while moving values with
+        # their columns. This path is intentionally serial within each row; it
+        # is a correctness-first in-place compaction path for reserved capacity.
+        for block in range(row_beg + 1, row_end):
+            scan = block
+            while scan > row_beg and columns[scan] < columns[scan - 1]:
+                col = columns[scan]
+                columns[scan] = columns[scan - 1]
+                columns[scan - 1] = col
+
+                for br in range(wp.static(block_rows)):
+                    for bc in range(wp.static(block_cols)):
+                        value = values[scan, br, bc]
+                        values[scan, br, bc] = values[scan - 1, br, bc]
+                        values[scan - 1, br, bc] = value
+
+                scan -= 1
+
+        zero = values.dtype(0.0)
+        write = row_beg
+        read = row_beg
+
+        while read < row_end:
+            col = columns[read]
+
+            if col < 0:
+                read += 1
+                continue
+
+            if write != read:
+                columns[write] = col
+                for br in range(wp.static(block_rows)):
+                    for bc in range(wp.static(block_cols)):
+                        values[write, br, bc] = values[read, br, bc]
+
+            read += 1
+
+            while read < row_end and columns[read] == col:
+                for br in range(wp.static(block_rows)):
+                    for bc in range(wp.static(block_cols)):
+                        values[write, br, bc] += values[read, br, bc]
+                read += 1
+
+            keep_block = True
+            if prune_numerical_zeros:
+                keep_block = False
+                for br in range(wp.static(block_rows)):
+                    for bc in range(wp.static(block_cols)):
+                        if values[write, br, bc] != zero:
+                            keep_block = True
+
+            if keep_block:
+                write += 1
+
+        row_ends[row] = write
+
+        for block in range(write, offsets[row + 1]):
+            columns[block] = -1
+            for br in range(wp.static(block_rows)):
+                for bc in range(wp.static(block_cols)):
+                    values[block, br, bc] = zero
+
+    return bsr_compress_inplace_rows
 
 
 @wp.kernel
@@ -469,6 +653,251 @@ def _bsr_accumulate_triplet_values(
     bsr_values[block, i, j] = val
 
 
+@wp.kernel
+def _bsr_set_from_triplets_masked_values(
+    count: wp.array(dtype=int),
+    row_count: int,
+    col_count: int,
+    rows: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    values: wp.array3d(dtype=Any),
+    bsr_offsets: wp.array(dtype=int),
+    bsr_row_ends: wp.array(dtype=int),
+    bsr_columns: wp.array(dtype=int),
+    bsr_values: wp.array3d(dtype=Any),
+):
+    triplet, i, j = wp.tid()
+
+    if count and triplet >= count[0]:
+        return
+
+    row = rows[triplet]
+    col = columns[triplet]
+    if row < 0 or row >= row_count or col < 0 or col >= col_count:
+        return
+
+    block = _bsr_block_index_active(row, col, bsr_offsets, bsr_columns, bsr_row_ends)
+    if block != -1:
+        wp.atomic_add(bsr_values, block, i, j, values[triplet, i, j])
+
+
+@wp.kernel(enable_backward=False)
+def _bsr_set_from_triplets_padded_count(
+    triplet_count: int,
+    count: wp.array(dtype=int),
+    row_count: int,
+    col_count: int,
+    rows: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    active_triplet_count = triplet_count
+    if count:
+        active_triplet_count = wp.min(count[0], triplet_count)
+
+    block_count = int(0)
+    for triplet in range(active_triplet_count):
+        tpl_row = rows[triplet]
+        col = columns[triplet]
+        if tpl_row != row or col < 0 or col >= col_count:
+            continue
+
+        duplicate = bool(False)
+        for prev in range(triplet):
+            if rows[prev] == row and columns[prev] == col:
+                duplicate = True
+
+        if not duplicate:
+            block_count += 1
+
+    row_beg = dest_offsets[row]
+    capacity_end = dest_offsets[row + 1]
+    if row_beg + block_count > capacity_end:
+        dest_row_ends[row] = row_beg
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+        return
+
+    row_end = row_beg + block_count
+    dest_row_ends[row] = row_end
+
+    for block in range(row_end, capacity_end):
+        dest_columns[block] = -1
+
+
+def make_bsr_set_from_triplets_padded_count_pruned(block_rows: int, block_cols: int):
+    from warp._src.fem.cache import dynamic_kernel  # noqa: PLC0415
+
+    @dynamic_kernel(suffix=(block_rows, block_cols), kernel_options={"enable_backward": False})
+    def bsr_set_from_triplets_padded_count_pruned(
+        triplet_count: int,
+        count: wp.array(dtype=int),
+        row_count: int,
+        col_count: int,
+        rows: wp.array(dtype=int),
+        columns: wp.array(dtype=int),
+        values: wp.array3d(dtype=Any),
+        dest_offsets: wp.array(dtype=int),
+        dest_row_ends: wp.array(dtype=int),
+        dest_columns: wp.array(dtype=int),
+        status: wp.array(dtype=int),
+    ):
+        row = wp.tid()
+
+        if row >= row_count:
+            return
+
+        active_triplet_count = triplet_count
+        if count:
+            active_triplet_count = wp.min(count[0], triplet_count)
+
+        zero = values.dtype(0.0)
+        block_count = int(0)
+        for triplet in range(active_triplet_count):
+            tpl_row = rows[triplet]
+            col = columns[triplet]
+            if tpl_row != row or col < 0 or col >= col_count:
+                continue
+
+            duplicate = bool(False)
+            for prev in range(triplet):
+                if rows[prev] == row and columns[prev] == col:
+                    duplicate = True
+
+            if not duplicate:
+                keep_block = bool(False)
+                for br in range(wp.static(block_rows)):
+                    for bc in range(wp.static(block_cols)):
+                        value = zero
+                        for dup in range(triplet, active_triplet_count):
+                            if rows[dup] == row and columns[dup] == col:
+                                value += values[dup, br, bc]
+
+                        if value != zero:
+                            keep_block = True
+
+                if keep_block:
+                    block_count += 1
+
+        row_beg = dest_offsets[row]
+        capacity_end = dest_offsets[row + 1]
+        if row_beg + block_count > capacity_end:
+            dest_row_ends[row] = row_beg
+            wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+            return
+
+        row_end = row_beg + block_count
+        dest_row_ends[row] = row_end
+
+        for block in range(row_end, capacity_end):
+            dest_columns[block] = -1
+
+    return bsr_set_from_triplets_padded_count_pruned
+
+
+@wp.kernel(enable_backward=False)
+def _bsr_set_from_triplets_padded_fill_columns(
+    triplet_count: int,
+    count: wp.array(dtype=int),
+    row_count: int,
+    col_count: int,
+    rows: wp.array(dtype=int),
+    columns: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    active_triplet_count = triplet_count
+    if count:
+        active_triplet_count = wp.min(count[0], triplet_count)
+
+    previous_col = int(-1)
+    for block in range(dest_offsets[row], dest_row_ends[row]):
+        next_col = col_count
+        for triplet in range(active_triplet_count):
+            col = columns[triplet]
+            if rows[triplet] == row and col > previous_col and col < next_col and col >= 0 and col < col_count:
+                next_col = col
+
+        dest_columns[block] = next_col
+        previous_col = next_col
+
+
+def make_bsr_set_from_triplets_padded_fill_values(block_rows: int, block_cols: int):
+    from warp._src.fem.cache import dynamic_kernel  # noqa: PLC0415
+
+    @dynamic_kernel(suffix=(block_rows, block_cols), kernel_options={"enable_backward": False})
+    def bsr_set_from_triplets_padded_fill_values(
+        prune_numerical_zeros: bool,
+        triplet_count: int,
+        count: wp.array(dtype=int),
+        row_count: int,
+        col_count: int,
+        rows: wp.array(dtype=int),
+        columns: wp.array(dtype=int),
+        values: wp.array3d(dtype=Any),
+        dest_offsets: wp.array(dtype=int),
+        dest_row_ends: wp.array(dtype=int),
+        dest_columns: wp.array(dtype=int),
+        dest_values: wp.array3d(dtype=Any),
+    ):
+        row, br, bc = wp.tid()
+
+        if row >= row_count:
+            return
+
+        active_triplet_count = triplet_count
+        if count:
+            active_triplet_count = wp.min(count[0], triplet_count)
+
+        zero = values.dtype(0.0)
+        previous_col = int(-1)
+        for block in range(dest_offsets[row], dest_row_ends[row]):
+            next_col = col_count
+            for triplet in range(active_triplet_count):
+                col = columns[triplet]
+                if rows[triplet] == row and col > previous_col and col < next_col and col >= 0 and col < col_count:
+                    keep_block = bool(True)
+                    if prune_numerical_zeros:
+                        keep_block = bool(False)
+                        for keep_br in range(wp.static(block_rows)):
+                            for keep_bc in range(wp.static(block_cols)):
+                                keep_value = zero
+                                for dup in range(active_triplet_count):
+                                    if rows[dup] == row and columns[dup] == col:
+                                        keep_value += values[dup, keep_br, keep_bc]
+
+                                if keep_value != zero:
+                                    keep_block = True
+
+                    if keep_block:
+                        next_col = col
+
+            value = zero
+            for triplet in range(active_triplet_count):
+                if rows[triplet] == row and columns[triplet] == next_col:
+                    value += values[triplet, br, bc]
+
+            if br == 0 and bc == 0:
+                dest_columns[block] = next_col
+            dest_values[block, br, bc] = value
+            previous_col = next_col
+
+    return bsr_set_from_triplets_padded_fill_values
+
+
 def bsr_set_from_triplets(
     dest: BsrMatrix[BlockType[Rows, Cols, Scalar]],
     rows: Array[int],
@@ -477,6 +906,9 @@ def bsr_set_from_triplets(
     count: Array[int] | None = None,
     prune_numerical_zeros: bool = True,
     masked: bool = False,
+    topology: str | None = None,
+    overflow: str = "error",
+    status: wp.array | None = None,
 ):
     """Fill a BSR matrix with values defined by coordinate-oriented (COO) triplets, discarding existing blocks.
 
@@ -493,7 +925,30 @@ def bsr_set_from_triplets(
           ``rows`` and ``columns`` arrays.
         prune_numerical_zeros: If ``True``, will ignore the zero-valued blocks.
         masked: If ``True``, ignore blocks that are not existing non-zeros of ``dest``.
+        topology: Optional topology policy. ``"compact"`` keeps the existing
+          compact rebuild behavior, ``"masked"`` is equivalent to
+          ``masked=True``, and ``"padded"`` writes the compacted triplet
+          topology into existing destination row capacity.
+        overflow: Overflow policy for ``topology="padded"``. ``"error"``
+          raises on insufficient row capacity, while ``"ignore"`` records
+          status in ``status`` and leaves overflowing rows undefined.
+        status: Optional single-element int array receiving asynchronous status
+          for ``topology="padded"``. Required when ``overflow="ignore"``.
     """
+    if topology is None:
+        topology = "masked" if masked else "compact"
+    elif topology not in ("compact", "masked", "padded"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+    elif masked and topology != "masked":
+        raise ValueError("Cannot pass masked=True with a non-masked topology policy")
+
+    if overflow not in ("error", "ignore"):
+        raise NotImplementedError("Only overflow='error' and overflow='ignore' are currently implemented")
+    if status is not None:
+        _bsr_validate_status_array(status, dest.device)
+        status.zero_()
+
+    masked = topology == "masked"
 
     if rows.device != columns.device or rows.device != dest.device:
         raise ValueError(
@@ -551,12 +1006,121 @@ def bsr_set_from_triplets(
 
     nnz = rows.shape[0]
     if nnz == 0:
-        bsr_set_zero(dest)
+        bsr_set_zero(dest, topology="padded" if topology == "padded" else "compact")
+        return
+
+    if topology == "padded":
+        if overflow == "ignore" and status is None:
+            raise ValueError("`status` must be supplied when using overflow='ignore'")
+
+        check_status = overflow == "error"
+        if status is None:
+            status = _bsr_temp_status(dest.device)
+
+        if values is not None and prune_numerical_zeros:
+            wp.launch(
+                make_bsr_set_from_triplets_padded_count_pruned(*dest.block_shape),
+                dim=dest.nrow,
+                device=dest.device,
+                inputs=[
+                    nnz,
+                    count,
+                    dest.nrow,
+                    dest.ncol,
+                    rows,
+                    columns,
+                    _as_3d_array(values, dest.block_shape),
+                    dest.offsets,
+                    dest.row_ends,
+                    dest.columns,
+                    status,
+                ],
+            )
+        else:
+            wp.launch(
+                _bsr_set_from_triplets_padded_count,
+                dim=dest.nrow,
+                device=dest.device,
+                inputs=[
+                    nnz,
+                    count,
+                    dest.nrow,
+                    dest.ncol,
+                    rows,
+                    columns,
+                    dest.offsets,
+                    dest.row_ends,
+                    dest.columns,
+                    status,
+                ],
+            )
+
+        if check_status:
+            _bsr_raise_if_status_error(status)
+
+        if values is None:
+            wp.launch(
+                _bsr_set_from_triplets_padded_fill_columns,
+                dim=dest.nrow,
+                device=dest.device,
+                inputs=[
+                    nnz,
+                    count,
+                    dest.nrow,
+                    dest.ncol,
+                    rows,
+                    columns,
+                    dest.offsets,
+                    dest.row_ends,
+                    dest.columns,
+                ],
+            )
+        else:
+            wp.launch(
+                make_bsr_set_from_triplets_padded_fill_values(*dest.block_shape),
+                dim=(dest.nrow, *dest.block_shape),
+                device=dest.device,
+                inputs=[
+                    prune_numerical_zeros,
+                    nnz,
+                    count,
+                    dest.nrow,
+                    dest.ncol,
+                    rows,
+                    columns,
+                    _as_3d_array(values, dest.block_shape),
+                    dest.offsets,
+                    dest.row_ends,
+                    dest.columns,
+                    dest.scalar_values,
+                ],
+            )
+        return
+
+    if masked:
+        dest.values.zero_()
+        if values is not None:
+            wp.launch(
+                _bsr_set_from_triplets_masked_values,
+                dim=(nnz, *dest.block_shape),
+                device=dest.device,
+                inputs=[
+                    count,
+                    dest.nrow,
+                    dest.ncol,
+                    rows,
+                    columns,
+                    _as_3d_array(values, dest.block_shape),
+                    dest.offsets,
+                    dest.row_ends,
+                    dest.columns,
+                    dest.scalar_values,
+                ],
+            )
         return
 
     # Increase dest array sizes if needed
-    if not masked:
-        _bsr_ensure_fits(dest, nnz=nnz)
+    _bsr_ensure_fits(dest, nnz=nnz)
 
     device = dest.values.device
     scalar_type = dest.scalar_type
@@ -591,6 +1155,7 @@ def bsr_set_from_triplets(
             ctypes.cast(summed_triplet_offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
             ctypes.cast(summed_triplet_indices.ptr, ctypes.POINTER(ctypes.c_int32)),
             ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+            ctypes.cast(dest.row_ends.ptr, ctypes.POINTER(ctypes.c_int32)),
             ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
             _optional_ctypes_pointer(nnz_buf, ctype=ctypes.c_int32),
             _optional_ctypes_event(nnz_event),
@@ -609,6 +1174,9 @@ def bsr_set_from_triplets(
             ],
             outputs=[dest.scalar_values],
         )
+
+        if not masked:
+            _bsr_set_compact_row_ends(dest)
 
 
 def bsr_from_triplets(
@@ -646,6 +1214,99 @@ def bsr_from_triplets(
     return A
 
 
+def bsr_compress(
+    src: BsrMatrixOrExpression[BlockType[Rows, Cols, Scalar]],
+    dest: BsrMatrix[BlockType[Rows, Cols, Scalar]] | None = None,
+    prune_numerical_zeros: bool = True,
+    inplace: bool = False,
+    work_arrays=None,
+) -> BsrMatrix[BlockType[Rows, Cols, Scalar]]:
+    """Compress the active blocks of ``src``.
+
+    Slack entries outside ``offsets[row]:row_ends[row]`` are ignored. When
+    ``inplace=False``, duplicate active entries are accumulated by the same
+    compact COO builder used by :func:`bsr_set_from_triplets` and ``dest`` is a
+    compact matrix. When ``inplace=True``, entries are sorted and coalesced
+    independently within each active source row.
+
+    Args:
+        src: Matrix to compact.
+        dest: Optional destination matrix. If omitted, a new compact matrix is
+          allocated.
+        prune_numerical_zeros: If ``True``, zero-valued blocks are pruned.
+        inplace: If ``True``, sort and coalesce each active row range directly
+          in ``src`` using its existing row capacity.
+        work_arrays: Reserved for future in-place and differentiable paths.
+    """
+
+    if work_arrays is not None:
+        raise NotImplementedError("bsr_compress work arrays are not implemented yet")
+
+    if inplace:
+        if dest is not None:
+            raise ValueError("Cannot provide 'dest' when bsr_compress(..., inplace=True)")
+        if not isinstance(src, BsrMatrix):
+            raise ValueError("bsr_compress(..., inplace=True) requires a concrete BsrMatrix")
+
+        if src.nrow > 0:
+            wp.launch(
+                kernel=make_bsr_compress_inplace_rows(*src.block_shape),
+                device=src.device,
+                dim=src.nrow,
+                inputs=[
+                    prune_numerical_zeros,
+                    src.offsets,
+                    src.row_ends,
+                    src.columns,
+                    src.scalar_values,
+                ],
+            )
+        return src
+
+    src, scale = _extract_matrix_and_scale(src)
+
+    if dest is None:
+        dest = bsr_zeros(src.nrow, src.ncol, block_type=src.values.dtype, device=src.device)
+        dest.values.requires_grad = src.requires_grad
+    else:
+        if dest.device != src.device:
+            raise ValueError(
+                f"Source and destination matrices must reside on the same device, got {src.device} and {dest.device}"
+            )
+        if dest.block_shape != src.block_shape or dest.scalar_type != src.scalar_type:
+            raise ValueError(
+                "Source and destination matrices must have the same block type, got "
+                f"({src.block_shape}, {src.scalar_type}) and ({dest.block_shape}, {dest.scalar_type})"
+            )
+        _bsr_resize(dest, rows_of_blocks=src.nrow, cols_of_blocks=src.ncol)
+
+    rows = src.uncompress_rows()
+    bsr_set_from_triplets(
+        dest,
+        rows,
+        src.columns[: src.nnz],
+        src.values[: src.nnz],
+        prune_numerical_zeros=prune_numerical_zeros,
+    )
+
+    if scale != 1.0:
+        bsr_scale(dest, scale)
+
+    if prune_numerical_zeros and dest.nnz > 0:
+        pruned = bsr_zeros(dest.nrow, dest.ncol, block_type=dest.values.dtype, device=dest.device)
+        pruned.values.requires_grad = dest.requires_grad
+        bsr_set_from_triplets(
+            pruned,
+            dest.uncompress_rows(),
+            dest.columns[: dest.nnz],
+            dest.values[: dest.nnz],
+            prune_numerical_zeros=True,
+        )
+        bsr_assign(dest=dest, src=pruned)
+
+    return dest
+
+
 class _BsrExpression(Generic[_BlockType]):
     pass
 
@@ -673,6 +1334,10 @@ class _BsrScalingExpression(_BsrExpression):
     @property
     def offsets(self) -> wp.array:
         return self.mat.offsets
+
+    @property
+    def row_ends(self) -> wp.array:
+        return self.mat.row_ends
 
     @property
     def columns(self) -> wp.array:
@@ -760,6 +1425,98 @@ def _extract_matrix_and_scale(bsr: BsrMatrixOrExpression):
     raise ValueError("Argument cannot be interpreted as a BsrMatrix")
 
 
+def bsr_validate(
+    A: BsrMatrixOrExpression,
+    require_sorted: bool = True,
+    require_unique: bool = True,
+    require_slack_sentinel: bool = False,
+    require_compact: bool = False,
+    raise_on_error: bool = True,
+) -> bool:
+    """Validate BSR/CSR row-capacity invariants on the host.
+
+    This helper synchronizes matrix metadata to the host. It is intended for
+    tests, debugging, and defensive validation around user-provided sparse
+    buffers.
+
+    Args:
+        A: Matrix to validate.
+        require_sorted: If ``True``, require active column indices to be sorted
+          within each row.
+        require_unique: If ``True``, require active column indices to be unique
+          within each row.
+        require_slack_sentinel: If ``True``, require every slack slot in
+          ``row_ends[row]:offsets[row + 1]`` to have column ``-1``.
+        require_compact: If ``True``, require ``row_ends`` to equal
+          ``offsets[1:]``. The host-side ``A.nnz`` value may still be an upper
+          bound until :meth:`BsrMatrix.nnz_sync` is called.
+        raise_on_error: If ``True``, raise ``ValueError`` on the first
+          validation failure. Otherwise return ``False``.
+    """
+
+    A, _ = _extract_matrix_and_scale(A)
+
+    def fail(message: str) -> bool:
+        if raise_on_error:
+            raise ValueError(message)
+        return False
+
+    if A.offsets.size < A.nrow + 1:
+        return fail(f"offsets array must have at least {A.nrow + 1} entries, got {A.offsets.size}")
+    if A.row_ends.size < A.nrow:
+        return fail(f"row_ends array must have at least {A.nrow} entries, got {A.row_ends.size}")
+    if A.columns.shape[0] < A.nnz:
+        return fail(f"columns array must have at least A.nnz entries, got {A.columns.shape[0]} and {A.nnz}")
+    if A.values.shape[0] < A.nnz:
+        return fail(f"values array must have at least A.nnz entries, got {A.values.shape[0]} and {A.nnz}")
+
+    offsets = A.offsets.numpy()[: A.nrow + 1]
+    row_ends = A.row_ends.numpy()[: A.nrow]
+    columns = A.columns.numpy()[: A.nnz]
+
+    if int(offsets[0]) != 0:
+        return fail(f"offsets[0] must be 0, got {int(offsets[0])}")
+
+    for row in range(A.nrow):
+        row_beg = int(offsets[row])
+        capacity_end = int(offsets[row + 1])
+        row_end = int(row_ends[row])
+
+        if row_beg > capacity_end:
+            return fail(f"offsets must be nondecreasing, got offsets[{row}] > offsets[{row + 1}]")
+        if row_beg < 0:
+            return fail(f"offsets[{row}] must be nonnegative, got {row_beg}")
+        if row_end < row_beg or row_end > capacity_end:
+            return fail(
+                f"row_ends[{row}] must satisfy offsets[{row}] <= row_ends[{row}] <= offsets[{row + 1}]"
+            )
+        if capacity_end > A.nnz:
+            return fail(f"offsets[{row + 1}] must be no larger than A.nnz, got {capacity_end} and {A.nnz}")
+        if require_compact and row_end != capacity_end:
+            return fail(f"row_ends[{row}] must equal offsets[{row + 1}] for compact matrices")
+
+        previous_col = -1
+        seen_cols = set()
+        for block in range(row_beg, row_end):
+            col = int(columns[block])
+            if col < 0 or col >= A.ncol:
+                return fail(f"active column at block {block} must be in [0, {A.ncol}), got {col}")
+            if require_sorted and block > row_beg and col < previous_col:
+                return fail(f"active columns must be sorted within row {row}")
+            if require_unique:
+                if col in seen_cols:
+                    return fail(f"active columns must be unique within row {row}, duplicate column {col}")
+                seen_cols.add(col)
+            previous_col = col
+
+        if require_slack_sentinel:
+            for block in range(row_end, capacity_end):
+                if int(columns[block]) != -1:
+                    return fail(f"slack column at block {block} must be -1, got {int(columns[block])}")
+
+    return True
+
+
 @wp.func
 def bsr_row_index(
     offsets: wp.array(dtype=int),
@@ -774,6 +1531,25 @@ def bsr_row_index(
         block_index: Index of the block.
     """
     return wp.where(block_index < offsets[row_count], wp.lower_bound(offsets, 0, row_count + 1, block_index + 1), 0) - 1
+
+
+@wp.func
+def _bsr_row_index_active(
+    offsets: wp.array(dtype=int),
+    row_count: int,
+    block_index: int,
+    row_ends: wp.array(dtype=int),
+) -> int:
+    """Return the row containing an active block in a capacity-aware BSR matrix."""
+
+    row = wp.lower_bound(row_ends, 0, row_count, block_index + 1)
+    if row == row_count:
+        return -1
+    if block_index < offsets[row]:
+        return -1
+    if block_index >= row_ends[row]:
+        return -1
+    return row
 
 
 @wp.func
@@ -804,6 +1580,33 @@ def bsr_block_index(
         return -1
 
     block_index = wp.lower_bound(bsr_columns, row_beg, row_end, col)
+    if block_index == row_end:
+        return -1
+    return wp.where(bsr_columns[block_index] == col, block_index, -1)
+
+
+@wp.func
+def _bsr_block_index_active(
+    row: int,
+    col: int,
+    bsr_offsets: wp.array(dtype=int),
+    bsr_columns: wp.array(dtype=int),
+    bsr_row_ends: wp.array(dtype=int),
+) -> int:
+    """Return the active block index in a capacity-aware BSR matrix."""
+
+    if row < 0:
+        return -1
+
+    row_beg = bsr_offsets[row]
+    row_end = bsr_row_ends[row]
+
+    if row_beg == row_end:
+        return -1
+
+    block_index = wp.lower_bound(bsr_columns, row_beg, row_end, col)
+    if block_index == row_end:
+        return -1
     return wp.where(bsr_columns[block_index] == col, block_index, -1)
 
 
@@ -815,6 +1618,7 @@ def _bsr_assign_list_blocks(
     dest_subcols: int,
     src_row_count: int,
     src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
     src_columns: wp.array(dtype=int),
     dest_rows: wp.array(dtype=int),
     dest_cols: wp.array(dtype=int),
@@ -822,7 +1626,7 @@ def _bsr_assign_list_blocks(
     block, subrow, subcol = wp.tid()
     dest_block = (block * src_subcols + subcol) * src_subrows + subrow
 
-    row = bsr_row_index(src_offsets, src_row_count, block)
+    row = _bsr_row_index_active(src_offsets, src_row_count, block, src_row_ends)
     if row == -1:
         dest_rows[dest_block] = row  # invalid
         dest_cols[dest_block] = row
@@ -842,16 +1646,18 @@ def _bsr_assign_copy_blocks(
     dest_subcols: int,
     src_row_count: int,
     src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
     src_columns: wp.array(dtype=int),
     src_values: wp.array3d(dtype=Any),
     dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
     dest_columns: wp.array(dtype=int),
     dest_values: wp.array3d(dtype=Any),
 ):
     src_block = wp.tid()
     src_block, subrow, subcol = wp.tid()
 
-    src_row = bsr_row_index(src_offsets, src_row_count, src_block)
+    src_row = _bsr_row_index_active(src_offsets, src_row_count, src_block, src_row_ends)
     if src_row == -1:
         return
 
@@ -862,7 +1668,7 @@ def _bsr_assign_copy_blocks(
     dest_row = dest_subrow // dest_subrows
     dest_col = dest_subcol // dest_subcols
 
-    dest_block = bsr_block_index(dest_row, dest_col, dest_offsets, dest_columns)
+    dest_block = _bsr_block_index_active(dest_row, dest_col, dest_offsets, dest_columns, dest_row_ends)
     if dest_block == -1:
         return
 
@@ -885,11 +1691,308 @@ def _bsr_assign_copy_blocks(
             )
 
 
+@wp.kernel(enable_backward=False)
+def _bsr_assign_padded_row_ranges(
+    row_count: int,
+    src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    src_beg = src_offsets[row]
+    src_end = src_row_ends[row]
+    src_count = src_end - src_beg
+
+    dest_beg = dest_offsets[row]
+    dest_capacity_end = dest_offsets[row + 1]
+    dest_count = dest_capacity_end - dest_beg
+
+    if src_count > dest_count:
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+        return
+
+    dest_active_end = dest_beg + src_count
+    dest_row_ends[row] = dest_active_end
+
+    for block in range(dest_active_end, dest_capacity_end):
+        dest_columns[block] = -1
+
+
+@wp.func
+def _bsr_ranges_overlap(first_a: int, count_a: int, first_b: int, count_b: int) -> bool:
+    return first_a < first_b + count_b and first_b < first_a + count_a
+
+
+@wp.kernel(enable_backward=False)
+def _bsr_assign_padded_reblock_topology(
+    src_subrows: int,
+    src_subcols: int,
+    dest_subrows: int,
+    dest_subcols: int,
+    src_row_count: int,
+    dest_row_count: int,
+    dest_col_count: int,
+    src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
+    src_columns: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    dest_row = wp.tid()
+
+    if dest_row >= dest_row_count:
+        return
+
+    block_count = int(0)
+    dest_subrow_first = dest_row * dest_subrows
+
+    for dest_col in range(dest_col_count):
+        dest_subcol_first = dest_col * dest_subcols
+        found = bool(False)
+
+        for src_row in range(src_row_count):
+            src_subrow_first = src_row * src_subrows
+            if _bsr_ranges_overlap(src_subrow_first, src_subrows, dest_subrow_first, dest_subrows):
+                for src_block in range(src_offsets[src_row], src_row_ends[src_row]):
+                    src_subcol_first = src_columns[src_block] * src_subcols
+                    if _bsr_ranges_overlap(src_subcol_first, src_subcols, dest_subcol_first, dest_subcols):
+                        found = True
+
+        if found:
+            block_count += 1
+
+    dest_beg = dest_offsets[dest_row]
+    capacity_end = dest_offsets[dest_row + 1]
+    row_end = dest_beg + block_count
+
+    if row_end > capacity_end:
+        dest_row_ends[dest_row] = dest_beg
+        for block in range(dest_beg, capacity_end):
+            dest_columns[block] = -1
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+        return
+
+    dest_row_ends[dest_row] = row_end
+
+    dest_block = dest_beg
+    for dest_col in range(dest_col_count):
+        dest_subcol_first = dest_col * dest_subcols
+        found = bool(False)
+
+        for src_row in range(src_row_count):
+            src_subrow_first = src_row * src_subrows
+            if _bsr_ranges_overlap(src_subrow_first, src_subrows, dest_subrow_first, dest_subrows):
+                for src_block in range(src_offsets[src_row], src_row_ends[src_row]):
+                    src_subcol_first = src_columns[src_block] * src_subcols
+                    if _bsr_ranges_overlap(src_subcol_first, src_subcols, dest_subcol_first, dest_subcols):
+                        found = True
+
+        if found:
+            dest_columns[dest_block] = dest_col
+            dest_block += 1
+
+    for block in range(row_end, capacity_end):
+        dest_columns[block] = -1
+
+
+@wp.kernel(enable_backward=False)
+def _bsr_copy_reblocked_capacity_counts(
+    src_subrows: int,
+    src_subcols: int,
+    dest_subrows: int,
+    src_row_count: int,
+    dest_row_count: int,
+    src_offsets: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+):
+    dest_row = wp.tid()
+
+    if dest_row >= dest_row_count:
+        return
+
+    if dest_row == 0:
+        dest_offsets[0] = 0
+
+    dest_subrow_first = dest_row * dest_subrows
+    block_count = int(0)
+
+    for src_row in range(src_row_count):
+        src_subrow_first = src_row * src_subrows
+        if _bsr_ranges_overlap(src_subrow_first, src_subrows, dest_subrow_first, dest_subrows):
+            block_count += (src_offsets[src_row + 1] - src_offsets[src_row]) * src_subcols
+
+    dest_offsets[dest_row + 1] = block_count
+
+
+@wp.kernel
+def _bsr_assign_padded_copy_blocks(
+    scale: Any,
+    structure_only: bool,
+    row_count: int,
+    src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
+    src_columns: wp.array(dtype=int),
+    src_values: wp.array3d(dtype=Any),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    dest_values: wp.array3d(dtype=Any),
+):
+    src_block, br, bc = wp.tid()
+
+    src_row = _bsr_row_index_active(src_offsets, row_count, src_block, src_row_ends)
+    if src_row == -1:
+        return
+
+    dest_block = dest_offsets[src_row] + src_block - src_offsets[src_row]
+    if dest_block >= dest_row_ends[src_row]:
+        return
+
+    if br == 0 and bc == 0:
+        dest_columns[dest_block] = src_columns[src_block]
+
+    if not structure_only:
+        dest_values[dest_block, br, bc] = dest_values.dtype(scale * src_values[src_block, br, bc])
+
+
+def _bsr_assign_padded_same_block(
+    dest: BsrMatrix,
+    src: BsrMatrix,
+    src_scale: float = 1.0,
+    structure_only: bool = False,
+    status: wp.array | None = None,
+    check_status: bool = True,
+):
+    if dest.block_shape != src.block_shape:
+        raise ValueError("Padded same-block assignment requires matching block shapes")
+
+    if status is None:
+        status = _bsr_temp_status(dest.device)
+    else:
+        status.zero_()
+
+    wp.launch(
+        _bsr_assign_padded_row_ranges,
+        dim=dest.nrow,
+        device=dest.device,
+        inputs=[
+            dest.nrow,
+            src.offsets,
+            src.row_ends,
+            dest.offsets,
+            dest.row_ends,
+            dest.columns,
+            status,
+        ],
+    )
+
+    if check_status:
+        _bsr_raise_if_status_error(status)
+
+    wp.launch(
+        _bsr_assign_padded_copy_blocks,
+        dim=(src.nnz, *src.block_shape),
+        device=dest.device,
+        inputs=[
+            src.scalar_type(src_scale),
+            structure_only,
+            dest.nrow,
+            src.offsets,
+            src.row_ends,
+            src.columns,
+            src.scalar_values,
+            dest.offsets,
+            dest.row_ends,
+            dest.columns,
+            dest.scalar_values,
+        ],
+    )
+
+
+def _bsr_assign_padded_reblock(
+    dest: BsrMatrix,
+    src: BsrMatrix,
+    src_scale: float,
+    src_subrows: int,
+    src_subcols: int,
+    dest_subrows: int,
+    dest_subcols: int,
+    structure_only: bool,
+    status: wp.array | None = None,
+    check_status: bool = True,
+):
+    if status is None:
+        status = _bsr_temp_status(dest.device)
+    else:
+        status.zero_()
+
+    wp.launch(
+        _bsr_assign_padded_reblock_topology,
+        dim=dest.nrow,
+        device=dest.device,
+        inputs=[
+            src_subrows,
+            src_subcols,
+            dest_subrows,
+            dest_subcols,
+            src.nrow,
+            dest.nrow,
+            dest.ncol,
+            src.offsets,
+            src.row_ends,
+            src.columns,
+            dest.offsets,
+            dest.row_ends,
+            dest.columns,
+            status,
+        ],
+    )
+
+    if check_status:
+        _bsr_raise_if_status_error(status)
+
+    if not structure_only:
+        dest.values.zero_()
+        wp.launch(
+            _bsr_assign_copy_blocks,
+            dim=(src.nnz, src_subrows, src_subcols),
+            device=dest.device,
+            inputs=[
+                src.scalar_type(src_scale),
+                src_subrows,
+                src_subcols,
+                dest_subrows,
+                dest_subcols,
+                src.nrow,
+                src.offsets,
+                src.row_ends,
+                src.columns,
+                src.scalar_values,
+                dest.offsets,
+                dest.row_ends,
+                dest.columns,
+                dest.scalar_values,
+            ],
+        )
+
+
 def bsr_assign(
     dest: BsrMatrix[BlockType[Rows, Cols, Scalar]],
     src: BsrMatrixOrExpression[BlockType[Any, Any, Any]],
     structure_only: bool = False,
     masked: bool = False,
+    topology: str | None = None,
+    overflow: str = "error",
+    status: wp.array | None = None,
 ):
     """Copy the content of the ``src`` BSR matrix to ``dest``.
 
@@ -901,12 +2004,36 @@ def bsr_assign(
         to accommodate at least ``src.nnz`` blocks. If ``structure_only`` is ``False``, values are also copied with implicit
         casting if the two matrices use distinct scalar types.
       masked: If ``True``, keep the non-zero topology of ``dest`` unchanged.
+      topology: Optional topology policy. ``"compact"`` keeps the existing
+        compact rebuild behavior, ``"masked"`` is equivalent to ``masked=True``,
+        and ``"padded"`` copies each source row into existing destination row
+        capacity without changing ``dest.offsets``.
+      overflow: Overflow policy for ``topology="padded"``. ``"error"``
+        raises on insufficient row capacity, while ``"ignore"`` records status
+        in ``status`` and leaves overflowing rows undefined.
+      status: Optional single-element int array receiving asynchronous status
+        for ``topology="padded"``. Required when ``overflow="ignore"``.
     """
 
     src, src_scale = _extract_matrix_and_scale(src)
 
     if dest.values.device != src.values.device:
         raise ValueError("Source and destination matrices must reside on the same device")
+
+    if topology is None:
+        topology = "masked" if masked else "compact"
+    elif topology not in ("compact", "masked", "padded"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+    elif masked and topology != "masked":
+        raise ValueError("Cannot pass masked=True with a non-masked topology policy")
+
+    if overflow not in ("error", "ignore"):
+        raise NotImplementedError("Only overflow='error' and overflow='ignore' are currently implemented")
+    if status is not None:
+        _bsr_validate_status_array(status, dest.device)
+        status.zero_()
+
+    masked = topology == "masked"
 
     if src.block_shape[0] >= dest.block_shape[0]:
         src_subrows = src.block_shape[0] // dest.block_shape[0]
@@ -940,6 +2067,45 @@ def bsr_assign(
             f"The requested block shape {dest.block_shape} does not evenly divide the source matrix of total size {src.shape}"
         )
 
+    if topology == "padded":
+        if overflow == "ignore" and status is None:
+            raise ValueError("`status` must be supplied when using overflow='ignore'")
+
+        if dest_nrow != dest.nrow or dest_ncol != dest.ncol:
+            raise ValueError(
+                f"Incompatible destination matrix size, expected ({dest_nrow}, {dest_ncol}), got ({dest.nrow}, {dest.ncol})"
+            )
+
+        if dest == src:
+            if not structure_only and src_scale != 1.0:
+                bsr_scale(dest, src_scale)
+            return
+
+        if dest.block_shape != src.block_shape:
+            _bsr_assign_padded_reblock(
+                dest=dest,
+                src=src,
+                src_scale=src_scale,
+                src_subrows=src_subrows,
+                src_subcols=src_subcols,
+                dest_subrows=dest_subrows,
+                dest_subcols=dest_subcols,
+                structure_only=structure_only,
+                status=status,
+                check_status=overflow == "error",
+            )
+            return
+
+        _bsr_assign_padded_same_block(
+            dest=dest,
+            src=src,
+            src_scale=src_scale,
+            structure_only=structure_only,
+            status=status,
+            check_status=overflow == "error",
+        )
+        return
+
     nnz_alloc = src.nnz * src_subrows * src_subcols
     if masked:
         if dest_nrow != dest.nrow or dest_ncol != dest.ncol:
@@ -953,6 +2119,7 @@ def bsr_assign(
         # Direct copy
 
         wp.copy(dest=dest.offsets, src=src.offsets, count=src.nrow + 1)
+        wp.copy(dest=dest.row_ends, src=src.row_ends, count=src.nrow)
         dest.notify_nnz_changed(nnz=nnz_alloc)
 
         if nnz_alloc > 0:
@@ -978,6 +2145,7 @@ def bsr_assign(
                     dest_subcols,
                     src.nrow,
                     src.offsets,
+                    src.row_ends,
                     src.columns,
                     dest_rows,
                     dest_cols,
@@ -1011,10 +2179,12 @@ def bsr_assign(
                     None,  # summed block offsets
                     None,  # summed block indices
                     ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(dest.row_ends.ptr, ctypes.POINTER(ctypes.c_int32)),
                     ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
                     _optional_ctypes_pointer(nnz_buf, ctype=ctypes.c_int32),
                     _optional_ctypes_event(nnz_event),
                 )
+            _bsr_set_compact_row_ends(dest)
 
         # copy block values
         if not structure_only:
@@ -1031,9 +2201,11 @@ def bsr_assign(
                     dest_subcols,
                     src.nrow,
                     src.offsets,
+                    src.row_ends,
                     src.columns,
                     src.scalar_values,
                     dest.offsets,
+                    dest.row_ends,
                     dest.columns,
                     dest.scalar_values,
                 ],
@@ -1045,6 +2217,7 @@ def bsr_copy(
     scalar_type: Scalar | None = None,
     block_shape: tuple[int, int] | None = None,
     structure_only: bool = False,
+    topology: str = "compact",
 ):
     """Return a copy of matrix ``A``, possibly changing its scalar type.
 
@@ -1056,25 +2229,112 @@ def bsr_copy(
        structure_only: If ``True``, only the non-zeros indices are copied, and uninitialized value storage is allocated
          to accommodate at least ``src.nnz`` blocks. If ``structure_only`` is ``False``, values are also copied with implicit
          casting if the two matrices use distinct scalar types.
+       topology: Topology policy for the copy. ``"compact"`` uses the existing
+         compact copy behavior, while ``"padded"`` preserves row capacity.
     """
+    src, src_scale = _extract_matrix_and_scale(A)
+
     if scalar_type is None:
-        scalar_type = A.scalar_type
+        scalar_type = src.scalar_type
     if block_shape is None:
-        block_shape = A.block_shape
+        block_shape = src.block_shape
 
     if block_shape == (1, 1):
         block_type = scalar_type
     else:
         block_type = wp.types.matrix(shape=block_shape, dtype=scalar_type)
 
-    copy = bsr_zeros(
-        rows_of_blocks=A.nrow,
-        cols_of_blocks=A.ncol,
-        block_type=block_type,
-        device=A.device,
-    )
-    copy.values.requires_grad = A.requires_grad
-    bsr_assign(dest=copy, src=A, structure_only=structure_only)
+    if topology == "padded":
+        if src.block_shape[0] >= block_shape[0]:
+            src_subrows = src.block_shape[0] // block_shape[0]
+            dest_subrows = 1
+        else:
+            dest_subrows = block_shape[0] // src.block_shape[0]
+            src_subrows = 1
+
+        if src_subrows * block_shape[0] != src.block_shape[0] * dest_subrows:
+            raise ValueError(
+                f"Incompatible dest and src block shapes; block rows must evenly divide one another (Got {block_shape[0]}, {src.block_shape[0]})"
+            )
+
+        if src.block_shape[1] >= block_shape[1]:
+            src_subcols = src.block_shape[1] // block_shape[1]
+            dest_subcols = 1
+        else:
+            dest_subcols = block_shape[1] // src.block_shape[1]
+            src_subcols = 1
+
+        if src_subcols * block_shape[1] != src.block_shape[1] * dest_subcols:
+            raise ValueError(
+                f"Incompatible dest and src block shapes; block columns must evenly divide one another (Got {block_shape[1]}, {src.block_shape[1]})"
+            )
+
+        copy_nrow = (src.nrow * src_subrows) // dest_subrows
+        copy_ncol = (src.ncol * src_subcols) // dest_subcols
+
+        if src.nrow * src_subrows != copy_nrow * dest_subrows or src.ncol * src_subcols != copy_ncol * dest_subcols:
+            raise ValueError(
+                f"The requested block shape {block_shape} does not evenly divide the source matrix of total size {src.shape}"
+            )
+
+        copy = bsr_zeros(
+            rows_of_blocks=copy_nrow,
+            cols_of_blocks=copy_ncol,
+            block_type=block_type,
+            device=src.device,
+        )
+        copy.values.requires_grad = src.requires_grad
+
+        if block_shape == src.block_shape:
+            _bsr_ensure_fits(copy, nnz=src.nnz)
+            wp.copy(dest=copy.offsets, src=src.offsets, count=src.nrow + 1)
+            _bsr_assign_padded_same_block(
+                dest=copy,
+                src=src,
+                src_scale=src_scale,
+                structure_only=structure_only,
+                check_status=False,
+            )
+        else:
+            max_nnz = src.nnz * src_subrows * src_subcols
+            _bsr_ensure_fits(copy, nnz=max_nnz)
+            if copy.nrow > 0:
+                wp.launch(
+                    _bsr_copy_reblocked_capacity_counts,
+                    dim=copy.nrow,
+                    device=copy.device,
+                    inputs=[
+                        src_subrows,
+                        src_subcols,
+                        dest_subrows,
+                        src.nrow,
+                        copy.nrow,
+                        src.offsets,
+                        copy.offsets,
+                    ],
+                )
+                warp._src.utils.array_scan(copy.offsets, copy.offsets, inclusive=True)
+            _bsr_assign_padded_reblock(
+                dest=copy,
+                src=src,
+                src_scale=src_scale,
+                src_subrows=src_subrows,
+                src_subcols=src_subcols,
+                dest_subrows=dest_subrows,
+                dest_subcols=dest_subcols,
+                structure_only=structure_only,
+                check_status=False,
+            )
+    else:
+        copy = bsr_zeros(
+            rows_of_blocks=src.nrow,
+            cols_of_blocks=src.ncol,
+            block_type=block_type,
+            device=src.device,
+        )
+        copy.values.requires_grad = src.requires_grad
+        bsr_assign(dest=copy, src=A, structure_only=structure_only, topology=topology)
+
     return copy
 
 
@@ -1083,10 +2343,12 @@ def _bsr_transpose_values(
     col_count: int,
     scale: Any,
     bsr_offsets: wp.array(dtype=int),
+    bsr_row_ends: wp.array(dtype=int),
     bsr_columns: wp.array(dtype=int),
     bsr_values: wp.array3d(dtype=Any),
     block_index_map: wp.array(dtype=int),
     transposed_bsr_offsets: wp.array(dtype=int),
+    transposed_bsr_row_ends: wp.array(dtype=int),
     transposed_bsr_columns: wp.array(dtype=int),
     transposed_bsr_values: wp.array3d(dtype=Any),
 ):
@@ -1098,19 +2360,92 @@ def _bsr_transpose_values(
     if block_index_map:
         src_block = block_index_map[block]
     else:
-        row = bsr_row_index(transposed_bsr_offsets, col_count, block)
+        row = _bsr_row_index_active(transposed_bsr_offsets, col_count, block, transposed_bsr_row_ends)
         col = transposed_bsr_columns[block]
-        src_block = bsr_block_index(col, row, bsr_offsets, bsr_columns)
+        src_block = _bsr_block_index_active(col, row, bsr_offsets, bsr_columns, bsr_row_ends)
         if src_block == -1:
             return
 
     transposed_bsr_values[block, i, j] = bsr_values[src_block, j, i] * scale
 
 
+@wp.kernel(enable_backward=False)
+def _bsr_set_transpose_padded_count(
+    src_row_count: int,
+    dest_row_count: int,
+    src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
+    src_columns: wp.array(dtype=int),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    dest_row = wp.tid()
+
+    if dest_row >= dest_row_count:
+        return
+
+    block_count = int(0)
+    for src_row in range(src_row_count):
+        if _bsr_block_index_active(src_row, dest_row, src_offsets, src_columns, src_row_ends) != -1:
+            block_count += 1
+
+    dest_beg = dest_offsets[dest_row]
+    dest_capacity_end = dest_offsets[dest_row + 1]
+    if dest_beg + block_count > dest_capacity_end:
+        dest_row_ends[dest_row] = dest_beg
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+        return
+
+    dest_active_end = dest_beg + block_count
+    dest_row_ends[dest_row] = dest_active_end
+
+    for block in range(dest_active_end, dest_capacity_end):
+        dest_columns[block] = -1
+
+
+@wp.kernel
+def _bsr_set_transpose_padded_values(
+    scale: Any,
+    src_row_count: int,
+    dest_row_count: int,
+    src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
+    src_columns: wp.array(dtype=int),
+    src_values: wp.array3d(dtype=Any),
+    dest_offsets: wp.array(dtype=int),
+    dest_row_ends: wp.array(dtype=int),
+    dest_columns: wp.array(dtype=int),
+    dest_values: wp.array3d(dtype=Any),
+):
+    dest_row, i, j = wp.tid()
+
+    if dest_row >= dest_row_count:
+        return
+
+    write = int(dest_offsets[dest_row])
+    dest_end = dest_row_ends[dest_row]
+
+    for src_row in range(src_row_count):
+        if write >= dest_end:
+            return
+
+        src_block = _bsr_block_index_active(src_row, dest_row, src_offsets, src_columns, src_row_ends)
+        if src_block != -1:
+            if i == 0 and j == 0:
+                dest_columns[write] = src_row
+            dest_values[write, i, j] = src_values[src_block, j, i] * scale
+            write += 1
+
+
 def bsr_set_transpose(
     dest: BsrMatrix[BlockType[Cols, Rows, Scalar]],
     src: BsrMatrixOrExpression[BlockType[Rows, Cols, Scalar]],
     masked: bool = False,
+    topology: str | None = None,
+    overflow: str = "error",
+    status: wp.array | None = None,
 ):
     """Assign the transposed matrix ``src`` to matrix ``dest``.
 
@@ -1118,9 +2453,33 @@ def bsr_set_transpose(
         dest: Sparse matrix to populate.
         src: Sparse matrix to transpose.
         masked: If ``True``, keep the non-zero topology of ``dest`` unchanged.
+        topology: Optional topology policy. ``"compact"`` keeps the existing
+          compact rebuild behavior, ``"masked"`` is equivalent to
+          ``masked=True``, and ``"padded"`` writes the transposed active
+          topology into existing destination row capacity.
+        overflow: Overflow policy for ``topology="padded"``. ``"error"``
+          raises on insufficient row capacity, while ``"ignore"`` records
+          status in ``status`` and leaves overflowing rows undefined.
+        status: Optional single-element int array receiving asynchronous status
+          for ``topology="padded"``. Required when ``overflow="ignore"``.
     """
 
     src, src_scale = _extract_matrix_and_scale(src)
+
+    if topology is None:
+        topology = "masked" if masked else "compact"
+    elif topology not in ("compact", "masked", "padded"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+    elif masked and topology != "masked":
+        raise ValueError("Cannot pass masked=True with a non-masked topology policy")
+
+    if overflow not in ("error", "ignore"):
+        raise NotImplementedError("Only overflow='error' and overflow='ignore' are currently implemented")
+    if status is not None:
+        _bsr_validate_status_array(status, dest.device)
+        status.zero_()
+
+    masked = topology == "masked"
 
     if dest.values.device != src.values.device:
         raise ValueError(
@@ -1134,6 +2493,59 @@ def bsr_set_transpose(
 
     if dest.block_shape != transpose_block_shape:
         raise ValueError(f"Destination block shape must be {transpose_block_shape}, got {dest.block_shape}")
+
+    if topology == "padded":
+        if overflow == "ignore" and status is None:
+            raise ValueError("`status` must be supplied when using overflow='ignore'")
+
+        if dest.nrow != src.ncol or dest.ncol != src.nrow:
+            raise ValueError(
+                f"Destination matrix must have {src.ncol} rows and {src.nrow} columns, got {dest.nrow} and {dest.ncol}"
+            )
+
+        check_status = overflow == "error"
+        if status is None:
+            status = _bsr_temp_status(dest.device)
+
+        wp.launch(
+            _bsr_set_transpose_padded_count,
+            dim=dest.nrow,
+            device=dest.device,
+            inputs=[
+                src.nrow,
+                dest.nrow,
+                src.offsets,
+                src.row_ends,
+                src.columns,
+                dest.offsets,
+                dest.row_ends,
+                dest.columns,
+                status,
+            ],
+        )
+
+        if check_status:
+            _bsr_raise_if_status_error(status)
+
+        wp.launch(
+            _bsr_set_transpose_padded_values,
+            dim=(dest.nrow, *dest.block_shape),
+            device=dest.device,
+            inputs=[
+                dest.scalar_type(src_scale),
+                src.nrow,
+                dest.nrow,
+                src.offsets,
+                src.row_ends,
+                src.columns,
+                src.scalar_values,
+                dest.offsets,
+                dest.row_ends,
+                dest.columns,
+                dest.scalar_values,
+            ],
+        )
+        return
 
     if masked:
         if dest.nrow != src.ncol or dest.ncol != src.nrow:
@@ -1168,6 +2580,7 @@ def bsr_set_transpose(
                 src.ncol,
                 nnz,
                 ctypes.cast(src.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                ctypes.cast(src.row_ends.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(src.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
@@ -1175,6 +2588,7 @@ def bsr_set_transpose(
             )
 
             dest._copy_nnz_async()
+            _bsr_set_compact_row_ends(dest)
 
     wp.launch(
         _bsr_transpose_values,
@@ -1184,10 +2598,12 @@ def bsr_set_transpose(
             src.ncol,
             dest.scalar_type(src_scale),
             src.offsets,
+            src.row_ends,
             src.columns,
             src.scalar_values,
             block_index_map,
             dest.offsets,
+            dest.row_ends,
             dest.columns,
         ],
         outputs=[dest.scalar_values],
@@ -1217,13 +2633,14 @@ def bsr_transposed(A: BsrMatrixOrExpression) -> BsrMatrix:
 def _bsr_get_diag_kernel(
     scale: Any,
     A_offsets: wp.array(dtype=int),
+    A_row_ends: wp.array(dtype=int),
     A_columns: wp.array(dtype=int),
     A_values: wp.array3d(dtype=Any),
     out: wp.array3d(dtype=Any),
 ):
     row, br, bc = wp.tid()
 
-    diag = bsr_block_index(row, row, A_offsets, A_columns)
+    diag = _bsr_block_index_active(row, row, A_offsets, A_columns, A_row_ends)
     if diag != -1:
         out[row, br, bc] = scale * A_values[diag, br, bc]
 
@@ -1255,7 +2672,14 @@ def bsr_get_diag(A: BsrMatrixOrExpression[BlockType], out: Array[BlockType] | No
         kernel=_bsr_get_diag_kernel,
         dim=(dim, *A.block_shape),
         device=A.values.device,
-        inputs=[A.scalar_type(scale), A.offsets, A.columns, A.scalar_values, _as_3d_array(out, A.block_shape)],
+        inputs=[
+            A.scalar_type(scale),
+            A.offsets,
+            A.row_ends,
+            A.columns,
+            A.scalar_values,
+            _as_3d_array(out, A.block_shape),
+        ],
     )
 
     return out
@@ -1318,10 +2742,11 @@ def bsr_set_diag(
 
     wp.launch(
         kernel=_bsr_set_diag_kernel,
-        dim=nnz + 1,
+        dim=A.nrow + 1,
         device=A.offsets.device,
         inputs=[nnz, A.offsets, A.columns],
     )
+    _bsr_set_compact_row_ends(A)
 
     A.notify_nnz_changed(nnz=nnz)  # notify change of offsets
 
@@ -1470,9 +2895,11 @@ def bsr_scale(x: BsrMatrixOrExpression, alpha: Scalar) -> BsrMatrix:
 
 
 @wp.kernel(enable_backward=False)
-def _bsr_get_block_row(row_count: int, bsr_offsets: wp.array(dtype=int), rows: wp.array(dtype=int)):
+def _bsr_get_block_row(
+    row_count: int, bsr_offsets: wp.array(dtype=int), bsr_row_ends: wp.array(dtype=int), rows: wp.array(dtype=int)
+):
     block = wp.tid()
-    rows[block] = bsr_row_index(bsr_offsets, row_count, block)
+    rows[block] = _bsr_row_index_active(bsr_offsets, row_count, block, bsr_row_ends)
 
 
 @wp.kernel
@@ -1482,6 +2909,7 @@ def _bsr_axpy_add_block(
     rows: wp.array(dtype=int),
     cols: wp.array(dtype=int),
     dst_offsets: wp.array(dtype=int),
+    dst_row_ends: wp.array(dtype=int),
     dst_columns: wp.array(dtype=int),
     src_values: wp.array3d(dtype=Any),
     dst_values: wp.array3d(dtype=Any),
@@ -1490,7 +2918,7 @@ def _bsr_axpy_add_block(
     row = rows[i + src_offset]
     col = cols[i + src_offset]
 
-    block = bsr_block_index(row, col, dst_offsets, dst_columns)
+    block = _bsr_block_index_active(row, col, dst_offsets, dst_columns, dst_row_ends)
     if block != -1:
         dst_values[block, br, bc] += scale * src_values[i, br, bc]
 
@@ -1500,25 +2928,171 @@ def _bsr_axpy_masked(
     alpha: Any,
     row_count: int,
     src_offsets: wp.array(dtype=int),
+    src_row_ends: wp.array(dtype=int),
     src_columns: wp.array(dtype=int),
     src_values: wp.array3d(dtype=Any),
     dst_offsets: wp.array(dtype=int),
+    dst_row_ends: wp.array(dtype=int),
     dst_columns: wp.array(dtype=int),
     dst_values: wp.array3d(dtype=Any),
 ):
     block, br, bc = wp.tid()
 
-    row = bsr_row_index(dst_offsets, row_count, block)
+    row = _bsr_row_index_active(dst_offsets, row_count, block, dst_row_ends)
     if row == -1:
         return
 
     col = dst_columns[block]
-    src_block = bsr_block_index(row, col, src_offsets, src_columns)
+    src_block = _bsr_block_index_active(row, col, src_offsets, src_columns, src_row_ends)
     if src_block != -1:
-        dst_values[block, br, bc] += alpha * src_values[src_block, br, bc]
+            dst_values[block, br, bc] += alpha * src_values[src_block, br, bc]
 
 
-class bsr_axpy_work_arrays:
+@wp.kernel(enable_backward=False)
+def _bsr_axpy_padded_count(
+    row_count: int,
+    x_offsets: wp.array(dtype=int),
+    x_row_ends: wp.array(dtype=int),
+    x_columns: wp.array(dtype=int),
+    y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
+    y_columns: wp.array(dtype=int),
+    row_block_counts: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    x_block = int(x_offsets[row])
+    x_end = x_row_ends[row]
+    y_block = int(y_offsets[row])
+    y_end = y_row_ends[row]
+
+    block_count = int(0)
+
+    while x_block < x_end and y_block < y_end:
+        x_col = x_columns[x_block]
+        y_col = y_columns[y_block]
+
+        block_count += 1
+        if x_col == y_col:
+            x_block += 1
+            y_block += 1
+        elif x_col < y_col:
+            x_block += 1
+        else:
+            y_block += 1
+
+    block_count += x_end - x_block
+    block_count += y_end - y_block
+
+    if y_offsets[row] + block_count > y_offsets[row + 1]:
+        row_block_counts[row] = -1
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+    else:
+        row_block_counts[row] = block_count
+
+
+@wp.kernel
+def _bsr_axpy_padded_fill(
+    alpha: Any,
+    beta: Any,
+    row_count: int,
+    x_offsets: wp.array(dtype=int),
+    x_row_ends: wp.array(dtype=int),
+    x_columns: wp.array(dtype=int),
+    x_values: wp.array3d(dtype=Any),
+    y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
+    y_columns: wp.array(dtype=int),
+    y_values: wp.array3d(dtype=Any),
+    row_block_counts: wp.array(dtype=int),
+):
+    row, br, bc = wp.tid()
+
+    if row >= row_count:
+        return
+
+    block_count = row_block_counts[row]
+    if block_count < 0:
+        return
+
+    x_block = x_row_ends[row] - 1
+    x_beg = x_offsets[row]
+    y_block = y_row_ends[row] - 1
+    y_beg = y_offsets[row]
+    write = int(y_beg + block_count - 1)
+
+    while write >= y_beg:
+        use_x = bool(False)
+        use_y = bool(False)
+        col = int(0)
+
+        if x_block >= x_beg and y_block >= y_beg:
+            x_col = x_columns[x_block]
+            y_col = y_columns[y_block]
+            if x_col == y_col:
+                use_x = True
+                use_y = True
+                col = x_col
+            elif x_col > y_col:
+                use_x = True
+                col = x_col
+            else:
+                use_y = True
+                col = y_col
+        elif x_block >= x_beg:
+            use_x = True
+            col = x_columns[x_block]
+        else:
+            use_y = True
+            col = y_columns[y_block]
+
+        value = y_values.dtype(0.0)
+        if use_x:
+            value += alpha * x_values[x_block, br, bc]
+            x_block -= 1
+        if use_y:
+            value += beta * y_values[y_block, br, bc]
+            y_block -= 1
+
+        if br == 0 and bc == 0:
+            y_columns[write] = col
+        y_values[write, br, bc] = value
+
+        write -= 1
+
+
+@wp.kernel(enable_backward=False)
+def _bsr_axpy_padded_finalize(
+    row_count: int,
+    y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
+    y_columns: wp.array(dtype=int),
+    row_block_counts: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    row_beg = y_offsets[row]
+    capacity_end = y_offsets[row + 1]
+    block_count = row_block_counts[row]
+
+    if block_count < 0:
+        y_row_ends[row] = row_beg
+        block_count = int(0)
+    else:
+        y_row_ends[row] = row_beg + block_count
+
+    for block in range(row_beg + block_count, capacity_end):
+        y_columns[block] = -1
+
+
+class bsr_axpy_work_arrays(_BsrStatusMixin):
     """Opaque structure for persisting :func:`bsr_axpy` temporary work buffers across calls."""
 
     def __init__(self):
@@ -1526,6 +3100,7 @@ class bsr_axpy_work_arrays:
 
     def _reset(self, device):
         self.device = device
+        self._reset_status()
         self._sum_rows = None
         self._sum_cols = None
         self._old_y_values = None
@@ -1551,6 +3126,8 @@ def bsr_axpy(
     beta: Scalar = 1.0,
     masked: bool = False,
     work_arrays: bsr_axpy_work_arrays | None = None,
+    topology: str | None = None,
+    overflow: str = "error",
 ) -> BsrMatrix[BlockType[Rows, Cols, Scalar]]:
     """Perform the sparse matrix addition ``y := alpha * X + beta * y`` on BSR matrices ``x`` and ``y`` and return ``y``.
 
@@ -1565,14 +3142,34 @@ def bsr_axpy(
         work_arrays: In most cases, this function will require the use of temporary storage.
           This storage can be reused across calls by passing an instance of
           :class:`bsr_axpy_work_arrays` in ``work_arrays``.
+        topology: Optional topology policy. ``"compact"`` keeps the existing
+          compact rebuild behavior, ``"masked"`` is equivalent to
+          ``masked=True``, and ``"padded"`` writes the result topology into
+          existing destination row capacity.
+        overflow: Overflow policy for ``topology="padded"``. ``"error"``
+          raises on insufficient row capacity, while ``"ignore"`` records
+          status in supplied ``work_arrays`` and leaves overflowing rows
+          undefined.
     """
 
     x, x_scale = _extract_matrix_and_scale(x)
     alpha *= x_scale
 
+    if topology is None:
+        topology = "masked" if masked else "compact"
+    elif topology not in ("compact", "masked", "padded"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+    elif masked and topology != "masked":
+        raise ValueError("Cannot pass masked=True with a non-masked topology policy")
+
+    if overflow not in ("error", "ignore"):
+        raise NotImplementedError("Only overflow='error' and overflow='ignore' are currently implemented")
+
+    masked = topology == "masked"
+
     if y is None:
-        if masked:
-            raise ValueError("Left-hand-side 'y' matrix must be provided for masked addition")
+        if masked or topology == "padded":
+            raise ValueError("Left-hand-side 'y' matrix must be provided for this topology policy")
 
         # If not output matrix is provided, allocate it for convenience
         y = bsr_zeros(x.nrow, x.ncol, block_type=x.values.dtype, device=x.values.device)
@@ -1581,6 +3178,102 @@ def bsr_axpy(
 
     x_nnz = x.nnz
     y_nnz = y.nnz
+
+    if topology == "padded":
+        if overflow == "ignore" and work_arrays is None:
+            raise ValueError("`work_arrays` must be supplied when using overflow='ignore'")
+
+        if x.values.device != y.values.device:
+            raise ValueError(
+                f"All arguments must reside on the same device, got {x.values.device} and {y.values.device}"
+            )
+
+        if x.scalar_type != y.scalar_type or x.block_shape != y.block_shape:
+            raise ValueError(
+                f"Matrices must have the same block type, got ({x.block_shape}, {x.scalar_type}) and ({y.block_shape}, {y.scalar_type})"
+            )
+
+        if x.nrow != y.nrow or x.ncol != y.ncol:
+            raise ValueError(
+                f"Matrices must have the same number of rows and columns, got ({x.nrow}, {x.ncol}) and ({y.nrow}, {y.ncol})"
+            )
+
+        if beta == 0.0:
+            status = work_arrays._ensure_status(y.device) if work_arrays is not None else None
+            bsr_assign(dest=y, src=x, topology="padded", overflow=overflow, status=status)
+            return bsr_scale(y, alpha=alpha)
+
+        if alpha == 0.0 or x_nnz == 0:
+            return bsr_scale(y, alpha=beta)
+
+        if x == y:
+            return bsr_scale(y, alpha=alpha + beta)
+
+        if not isinstance(alpha, y.scalar_type):
+            alpha = y.scalar_type(alpha)
+        if not isinstance(beta, y.scalar_type):
+            beta = y.scalar_type(beta)
+
+        if work_arrays is None:
+            work_arrays = bsr_axpy_work_arrays()
+
+        work_arrays._allocate(y.device, y, max(x_nnz + y_nnz, y.nrow))
+        status = work_arrays._ensure_status(y.device)
+        row_block_counts = work_arrays._sum_rows
+
+        wp.launch(
+            _bsr_axpy_padded_count,
+            dim=y.nrow,
+            device=y.device,
+            inputs=[
+                y.nrow,
+                x.offsets,
+                x.row_ends,
+                x.columns,
+                y.offsets,
+                y.row_ends,
+                y.columns,
+                row_block_counts,
+                status,
+            ],
+        )
+
+        if overflow == "error":
+            _bsr_raise_if_status_error(status)
+
+        wp.launch(
+            _bsr_axpy_padded_fill,
+            dim=(y.nrow, *y.block_shape),
+            device=y.device,
+            inputs=[
+                alpha,
+                beta,
+                y.nrow,
+                x.offsets,
+                x.row_ends,
+                x.columns,
+                x.scalar_values,
+                y.offsets,
+                y.row_ends,
+                y.columns,
+                y.scalar_values,
+                row_block_counts,
+            ],
+        )
+
+        wp.launch(
+            _bsr_axpy_padded_finalize,
+            dim=y.nrow,
+            device=y.device,
+            inputs=[
+                y.nrow,
+                y.offsets,
+                y.row_ends,
+                y.columns,
+                row_block_counts,
+            ],
+        )
+        return y
 
     # Handle easy cases first
     if beta == 0.0 or y_nnz == 0:
@@ -1625,9 +3318,11 @@ def bsr_axpy(
                 alpha,
                 x.nrow,
                 x.offsets,
+                x.row_ends,
                 x.columns,
                 x.scalar_values,
                 y.offsets,
+                y.row_ends,
                 y.columns,
                 y.scalar_values,
             ],
@@ -1678,10 +3373,12 @@ def bsr_axpy(
                 None,  # summed block offsets
                 None,  # summed block indices
                 ctypes.cast(y.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                ctypes.cast(y.row_ends.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(y.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
                 _optional_ctypes_pointer(nnz_buf, ctype=ctypes.c_int32),
                 _optional_ctypes_event(nnz_event),
             )
+        _bsr_set_compact_row_ends(y)
 
         y.values.zero_()
 
@@ -1695,6 +3392,7 @@ def bsr_axpy(
                 work_arrays._sum_rows,
                 work_arrays._sum_cols,
                 y.offsets,
+                y.row_ends,
                 y.columns,
                 _as_3d_array(work_arrays._old_y_values, y.block_shape),
                 y.scalar_values,
@@ -1711,6 +3409,7 @@ def bsr_axpy(
                 work_arrays._sum_rows,
                 work_arrays._sum_cols,
                 y.offsets,
+                y.row_ends,
                 y.columns,
                 x.scalar_values,
                 y.scalar_values,
@@ -1728,8 +3427,10 @@ def make_bsr_mm_count_coeffs(tile_size):
         y_ncol: int,
         z_nnz: int,
         x_offsets: wp.array(dtype=int),
+        x_row_ends: wp.array(dtype=int),
         x_columns: wp.array(dtype=int),
         y_offsets: wp.array(dtype=int),
+        y_row_ends: wp.array(dtype=int),
         y_columns: wp.array(dtype=int),
         row_min: wp.array(dtype=int),
         block_counts: wp.array(dtype=int),
@@ -1738,15 +3439,15 @@ def make_bsr_mm_count_coeffs(tile_size):
         row_count = int(0)
 
         x_beg = x_offsets[row]
-        x_end = x_offsets[row + 1]
+        x_end = x_row_ends[row]
 
         min_col = y_ncol
         max_col = int(0)
 
         for x_block in range(x_beg + lane, x_end, tile_size):
             x_col = x_columns[x_block]
-            y_row_end = y_offsets[x_col + 1]
             y_row_beg = y_offsets[x_col]
+            y_row_end = y_row_ends[x_col]
             block_count = y_row_end - y_row_beg
             if block_count != 0:
                 min_col = wp.min(y_columns[y_row_beg], min_col)
@@ -1787,8 +3488,10 @@ def _bsr_mm_list_coeffs(
     mm_nnz: int,
     x_nrow: int,
     x_offsets: wp.array(dtype=int),
+    x_row_ends: wp.array(dtype=int),
     x_columns: wp.array(dtype=int),
     y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
     y_columns: wp.array(dtype=int),
     mm_row_min: wp.array(dtype=int),
     mm_offsets: wp.array(dtype=int),
@@ -1816,7 +3519,7 @@ def _bsr_mm_list_coeffs(
 
     pos = mm_block - mm_offsets[x_block]
 
-    row = bsr_row_index(x_offsets, x_nrow, x_block)
+    row = _bsr_row_index_active(x_offsets, x_nrow, x_block, x_row_ends)
 
     row_min_col = mm_row_min[row]
     if row_min_col == -1:
@@ -1840,10 +3543,11 @@ def _bsr_mm_use_triplets(
     mm_block: int,
     mm_row_min: wp.array(dtype=int),
     row_offsets: wp.array(dtype=int),
+    row_ends: wp.array(dtype=int),
     summed_triplet_offsets: wp.array(dtype=int),
 ):
     x_beg = row_offsets[row]
-    x_end = row_offsets[row + 1]
+    x_end = row_ends[row]
 
     if mm_row_min:
         if mm_row_min[row] == -1:
@@ -1863,9 +3567,11 @@ def _bsr_mm_use_triplets(
 def _bsr_mm_compute_values(
     alpha: Any,
     x_offsets: wp.array(dtype=int),
+    x_row_ends: wp.array(dtype=int),
     x_columns: wp.array(dtype=int),
     x_values: wp.array(dtype=Any),
     y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
     y_columns: wp.array(dtype=int),
     y_values: wp.array(dtype=Any),
     mm_row_min: wp.array(dtype=int),
@@ -1873,17 +3579,18 @@ def _bsr_mm_compute_values(
     summed_triplet_src_blocks: wp.indexedarray(dtype=int),
     mm_row_count: int,
     mm_offsets: wp.array(dtype=int),
+    mm_row_ends: wp.array(dtype=int),
     mm_cols: wp.array(dtype=int),
     mm_values: wp.array(dtype=Any),
 ):
     mm_block = wp.tid()
 
-    row = bsr_row_index(mm_offsets, mm_row_count, mm_block)
+    row = _bsr_row_index_active(mm_offsets, mm_row_count, mm_block, mm_row_ends)
     if row == -1:
         return
 
     use_triplets, block_beg, block_end = _bsr_mm_use_triplets(
-        row, mm_block, mm_row_min, x_offsets, summed_triplet_offsets
+        row, mm_block, mm_row_min, x_offsets, x_row_ends, summed_triplet_offsets
     )
 
     mm_val = mm_values.dtype(type(alpha)(0.0))
@@ -1893,12 +3600,12 @@ def _bsr_mm_compute_values(
             x_block = summed_triplet_src_blocks[tpl_idx]
             x_col = x_columns[x_block]
             if x_block != -1:
-                y_block = bsr_block_index(x_col, col, y_offsets, y_columns)
+                y_block = _bsr_block_index_active(x_col, col, y_offsets, y_columns, y_row_ends)
                 mm_val += x_values[x_block] * y_values[y_block]
     else:
         for x_block in range(block_beg, block_end):
             x_col = x_columns[x_block]
-            y_block = bsr_block_index(x_col, col, y_offsets, y_columns)
+            y_block = _bsr_block_index_active(x_col, col, y_offsets, y_columns, y_row_ends)
             if y_block != -1:
                 mm_val += x_values[x_block] * y_values[y_block]
 
@@ -1939,9 +3646,11 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
     def bsr_mm_compute_values(
         alpha: Any,
         x_offsets: wp.array(dtype=int),
+        x_row_ends: wp.array(dtype=int),
         x_columns: wp.array(dtype=int),
         x_values: wp.array3d(dtype=Any),
         y_offsets: wp.array(dtype=int),
+        y_row_ends: wp.array(dtype=int),
         y_columns: wp.array(dtype=int),
         y_values: wp.array3d(dtype=Any),
         mm_row_min: wp.array(dtype=int),
@@ -1949,6 +3658,7 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
         summed_triplet_src_blocks: wp.indexedarray(dtype=int),
         mm_row_count: int,
         mm_offsets: wp.array(dtype=int),
+        mm_row_ends: wp.array(dtype=int),
         mm_cols: wp.array(dtype=int),
         mm_values: wp.array3d(dtype=Any),
     ):
@@ -1960,14 +3670,14 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
         brow_count = wp.min(mm_values.shape[1] - brow_off, subblock_rows)
         bcol_count = wp.min(mm_values.shape[2] - bcol_off, subblock_cols)
 
-        mm_row = bsr_row_index(mm_offsets, mm_row_count, mm_block)
+        mm_row = _bsr_row_index_active(mm_offsets, mm_row_count, mm_block, mm_row_ends)
         if mm_row == -1:
             return
 
         lane_val = mm_type()
 
         use_triplets, block_beg, block_end = _bsr_mm_use_triplets(
-            mm_row, mm_block, mm_row_min, x_offsets, summed_triplet_offsets
+            mm_row, mm_block, mm_row_min, x_offsets, x_row_ends, summed_triplet_offsets
         )
 
         col_count = (block_end - block_beg) * block_depth
@@ -1982,7 +3692,7 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
                 x_block = summed_triplet_src_blocks[tpl_block]
                 if x_block != -1:
                     x_col = x_columns[x_block]
-                    y_block = bsr_block_index(x_col, mm_col, y_offsets, y_columns)
+                    y_block = _bsr_block_index_active(x_col, mm_col, y_offsets, y_columns, y_row_ends)
                     lane_val += _outer_product(
                         x_values[x_block], y_values[y_block], brow_off, bcol_off, block_col, brow_count, bcol_count
                     )
@@ -1993,7 +3703,7 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
                 x_block += block_beg
 
                 x_col = x_columns[x_block]
-                y_block = bsr_block_index(x_col, mm_col, y_offsets, y_columns)
+                y_block = _bsr_block_index_active(x_col, mm_col, y_offsets, y_columns, y_row_ends)
 
                 if y_block != -1:
                     lane_val += _outer_product(
@@ -2011,7 +3721,153 @@ def make_bsr_mm_compute_values_tiled_outer(subblock_rows, subblock_cols, block_d
     return bsr_mm_compute_values
 
 
-class bsr_mm_work_arrays:
+@wp.kernel(enable_backward=False)
+def _bsr_mm_padded_count(
+    beta_nonzero: bool,
+    row_count: int,
+    col_count: int,
+    x_offsets: wp.array(dtype=int),
+    x_row_ends: wp.array(dtype=int),
+    x_columns: wp.array(dtype=int),
+    y_offsets: wp.array(dtype=int),
+    y_row_ends: wp.array(dtype=int),
+    y_columns: wp.array(dtype=int),
+    z_offsets: wp.array(dtype=int),
+    z_row_ends: wp.array(dtype=int),
+    z_columns: wp.array(dtype=int),
+    row_block_counts: wp.array(dtype=int),
+    status: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row >= row_count:
+        return
+
+    previous_col = int(-1)
+    block_count = int(0)
+    searching = bool(True)
+
+    while searching:
+        next_col = col_count
+
+        if beta_nonzero:
+            for z_block in range(z_offsets[row], z_row_ends[row]):
+                col = z_columns[z_block]
+                if col > previous_col and col < next_col:
+                    next_col = col
+
+        for x_block in range(x_offsets[row], x_row_ends[row]):
+            x_col = x_columns[x_block]
+            for y_block in range(y_offsets[x_col], y_row_ends[x_col]):
+                col = y_columns[y_block]
+                if col > previous_col and col < next_col:
+                    next_col = col
+
+        if next_col == col_count:
+            searching = False
+        else:
+            block_count += 1
+            previous_col = next_col
+
+    if z_offsets[row] + block_count > z_offsets[row + 1]:
+        row_block_counts[row] = -1
+        wp.atomic_max(status, 0, _BSR_STATUS_ROW_CAPACITY_EXCEEDED)
+    else:
+        row_block_counts[row] = block_count
+
+
+def make_bsr_mm_padded_fill(block_depth: int):
+    from warp._src.fem.cache import dynamic_kernel  # noqa: PLC0415
+
+    @dynamic_kernel(suffix=block_depth, kernel_options={"enable_backward": False})
+    def bsr_mm_padded_fill(
+        alpha: Any,
+        beta: Any,
+        beta_nonzero: bool,
+        row_count: int,
+        col_count: int,
+        x_offsets: wp.array(dtype=int),
+        x_row_ends: wp.array(dtype=int),
+        x_columns: wp.array(dtype=int),
+        x_values: wp.array3d(dtype=Any),
+        y_offsets: wp.array(dtype=int),
+        y_row_ends: wp.array(dtype=int),
+        y_columns: wp.array(dtype=int),
+        y_values: wp.array3d(dtype=Any),
+        z_offsets: wp.array(dtype=int),
+        old_z_row_ends: wp.array(dtype=int),
+        old_z_columns: wp.array(dtype=int),
+        old_z_values: wp.array3d(dtype=Any),
+        z_row_ends: wp.array(dtype=int),
+        z_columns: wp.array(dtype=int),
+        z_values: wp.array3d(dtype=Any),
+        row_block_counts: wp.array(dtype=int),
+    ):
+        row, br, bc = wp.tid()
+
+        if row >= row_count:
+            return
+
+        row_beg = z_offsets[row]
+        capacity_end = z_offsets[row + 1]
+        block_count = row_block_counts[row]
+
+        if block_count < 0:
+            if br == 0 and bc == 0:
+                z_row_ends[row] = row_beg
+                for block in range(row_beg, capacity_end):
+                    z_columns[block] = -1
+            return
+
+        row_end = row_beg + block_count
+        previous_col = int(-1)
+
+        for z_block in range(row_beg, row_end):
+            next_col = col_count
+
+            if beta_nonzero:
+                for old_z_block in range(z_offsets[row], old_z_row_ends[row]):
+                    col = old_z_columns[old_z_block]
+                    if col > previous_col and col < next_col:
+                        next_col = col
+
+            for x_block in range(x_offsets[row], x_row_ends[row]):
+                x_col = x_columns[x_block]
+                for y_block in range(y_offsets[x_col], y_row_ends[x_col]):
+                    col = y_columns[y_block]
+                    if col > previous_col and col < next_col:
+                        next_col = col
+
+            value = z_values.dtype(type(alpha)(0.0))
+
+            if beta_nonzero:
+                old_z_block = _bsr_block_index_active(row, next_col, z_offsets, old_z_columns, old_z_row_ends)
+                if old_z_block != -1:
+                    value += beta * old_z_values[old_z_block, br, bc]
+
+            for x_block in range(x_offsets[row], x_row_ends[row]):
+                x_col = x_columns[x_block]
+                y_block = _bsr_block_index_active(x_col, next_col, y_offsets, y_columns, y_row_ends)
+                if y_block != -1:
+                    product = z_values.dtype(0.0)
+                    for k in range(wp.static(block_depth)):
+                        product += x_values[x_block, br, k] * y_values[y_block, k, bc]
+                    value += alpha * product
+
+            if br == 0 and bc == 0:
+                z_columns[z_block] = next_col
+            z_values[z_block, br, bc] = value
+            previous_col = next_col
+
+        if br == 0 and bc == 0:
+            z_row_ends[row] = row_end
+            for block in range(row_end, capacity_end):
+                z_columns[block] = -1
+
+    return bsr_mm_padded_fill
+
+
+class bsr_mm_work_arrays(_BsrStatusMixin):
     """Opaque structure for persisting :func:`bsr_mm` temporary work buffers across calls."""
 
     def __init__(self):
@@ -2019,6 +3875,7 @@ class bsr_mm_work_arrays:
 
     def _reset(self, device):
         self.device = device
+        self._reset_status()
         self._mm_row_min = None
         self._mm_block_counts = None
         self._mm_rows = None
@@ -2026,6 +3883,7 @@ class bsr_mm_work_arrays:
         self._mm_src_blocks = None
         self._old_z_values = None
         self._old_z_offsets = None
+        self._old_z_row_ends = None
         self._old_z_columns = None
         self._mm_nnz = 0
 
@@ -2050,6 +3908,8 @@ class bsr_mm_work_arrays:
                 self._old_z_columns = wp.empty(shape=(z.nnz,), dtype=z.columns.dtype, device=self.device)
             if self._old_z_offsets is None or self._old_z_offsets.size < z.nrow + 1:
                 self._old_z_offsets = wp.empty(shape=(z.nrow + 1,), dtype=z.offsets.dtype, device=self.device)
+            if self._old_z_row_ends is None or self._old_z_row_ends.size < z.nrow:
+                self._old_z_row_ends = wp.empty(shape=(z.nrow,), dtype=z.row_ends.dtype, device=self.device)
 
     def _allocate_stage_2(self, mm_nnz: int):
         # Allocations that depend on unmerged nnz estimate
@@ -2073,6 +3933,8 @@ def bsr_mm(
     reuse_topology: bool = False,
     tile_size: int = 0,
     max_new_nnz: int | None = None,
+    topology: str | None = None,
+    overflow: str = "error",
 ) -> BsrMatrix[BlockType[Rows, Cols, Scalar]]:
     """Perform the sparse matrix-matrix multiplication ``z := alpha * x @ y + beta * z`` on BSR matrices ``x``, ``y`` and ``z``, and return ``z``.
 
@@ -2083,6 +3945,8 @@ def bsr_mm(
      - ``masked=True``
      - ``reuse_topology=True``
      - ``max_new_nnz`` is provided
+     - ``topology="padded"`` is used with ``overflow="ignore"`` and supplied
+       ``work_arrays``
 
     Args:
         x: Read-only left operand of the matrix-matrix product.
@@ -2103,6 +3967,15 @@ def bsr_mm(
         tile_size: If a positive integer, use tiles of this size to compute the matrix-matrix product.
           If negative, disable tile-based computation. Defaults to ``0``, which determines whether to
           use tiles using using an heuristic based on the matrix shape and number of non-zeros..
+        topology: Optional topology policy. ``"compact"`` keeps the existing
+          compact rebuild behavior, ``"masked"`` is equivalent to
+          ``masked=True``, ``"cached"`` is equivalent to
+          ``reuse_topology=True``, and ``"padded"`` writes the result topology
+          into existing destination row capacity.
+        overflow: Overflow policy for ``topology="padded"``. ``"error"``
+          raises on insufficient row capacity, while ``"ignore"`` records
+          status in supplied ``work_arrays`` and leaves overflowing rows
+          undefined.
     """
 
     x, x_scale = _extract_matrix_and_scale(x)
@@ -2110,9 +3983,26 @@ def bsr_mm(
     y, y_scale = _extract_matrix_and_scale(y)
     alpha *= y_scale
 
+    if topology is None:
+        topology = "masked" if masked else "cached" if reuse_topology else "compact"
+    elif topology not in ("compact", "masked", "cached", "padded"):
+        raise ValueError(f"Unsupported topology policy: {topology}")
+    elif masked and topology != "masked":
+        raise ValueError("Cannot pass masked=True with a non-masked topology policy")
+
+    if overflow not in ("error", "ignore"):
+        raise NotImplementedError("Only overflow='error' and overflow='ignore' are currently implemented")
+
+    if topology == "masked":
+        masked = True
+    elif topology == "cached":
+        reuse_topology = True
+    elif topology == "padded" and reuse_topology:
+        raise ValueError("reuse_topology is not supported with topology='padded'")
+
     if z is None:
-        if masked:
-            raise ValueError("Left-hand-side 'z' matrix must be provided for masked multiplication")
+        if masked or topology == "padded":
+            raise ValueError("Left-hand-side 'z' matrix must be provided for this topology policy")
 
         # If not output matrix is provided, allocate it for convenience
         z_block_shape = (x.block_shape[0], y.block_shape[1])
@@ -2149,6 +4039,106 @@ def bsr_mm(
         )
 
     device = z.values.device
+
+    if topology == "padded":
+        if overflow == "ignore" and work_arrays is None:
+            raise ValueError("`work_arrays` must be supplied when using overflow='ignore'")
+
+        if alpha == 0.0 or x.nnz == 0 or y.nnz == 0:
+            return bsr_scale(z, beta)
+
+        if work_arrays is None:
+            work_arrays = bsr_mm_work_arrays()
+
+        if not isinstance(alpha, z.scalar_type):
+            alpha = z.scalar_type(alpha)
+        if not isinstance(beta, z.scalar_type):
+            beta = z.scalar_type(beta)
+
+        beta_nonzero = beta != z.scalar_type(0.0)
+        x_aliasing = z == x
+        y_aliasing = z == y
+        z_aliasing = x_aliasing or y_aliasing
+        snapshot_z = beta_nonzero or z_aliasing
+
+        work_arrays._allocate_stage_1(device, x.nnz, z, beta if beta_nonzero else 0.0, snapshot_z)
+        row_block_counts = work_arrays._mm_row_min
+        status = work_arrays._ensure_status(z.device)
+
+        if snapshot_z:
+            wp.copy(dest=work_arrays._old_z_row_ends, src=z.row_ends, count=z.nrow)
+            wp.copy(dest=work_arrays._old_z_columns, src=z.columns, count=z.nnz)
+            wp.copy(dest=work_arrays._old_z_values, src=z.values, count=z.nnz)
+            old_z_row_ends = work_arrays._old_z_row_ends
+            old_z_columns = work_arrays._old_z_columns
+            old_z_values = work_arrays._old_z_values
+        else:
+            old_z_row_ends = z.row_ends
+            old_z_columns = z.columns
+            old_z_values = z.values
+
+        x_row_ends = old_z_row_ends if x_aliasing else x.row_ends
+        x_columns = old_z_columns if x_aliasing else x.columns
+        x_values = _as_3d_array(old_z_values, x.block_shape) if x_aliasing else x.scalar_values
+
+        y_row_ends = old_z_row_ends if y_aliasing else y.row_ends
+        y_columns = old_z_columns if y_aliasing else y.columns
+        y_values = _as_3d_array(old_z_values, y.block_shape) if y_aliasing else y.scalar_values
+
+        wp.launch(
+            _bsr_mm_padded_count,
+            dim=z.nrow,
+            device=device,
+            inputs=[
+                beta_nonzero,
+                z.nrow,
+                z.ncol,
+                x.offsets,
+                x_row_ends,
+                x_columns,
+                y.offsets,
+                y_row_ends,
+                y_columns,
+                z.offsets,
+                z.row_ends,
+                z.columns,
+                row_block_counts,
+                status,
+            ],
+        )
+
+        if overflow == "error":
+            _bsr_raise_if_status_error(status)
+
+        wp.launch(
+            make_bsr_mm_padded_fill(x.block_shape[1]),
+            dim=(z.nrow, *z.block_shape),
+            device=device,
+            inputs=[
+                alpha,
+                beta,
+                beta_nonzero,
+                z.nrow,
+                z.ncol,
+                x.offsets,
+                x_row_ends,
+                x_columns,
+                x_values,
+                y.offsets,
+                y_row_ends,
+                y_columns,
+                y_values,
+                z.offsets,
+                old_z_row_ends,
+                old_z_columns,
+                _as_3d_array(old_z_values, z.block_shape),
+                z.row_ends,
+                z.columns,
+                z.scalar_values,
+                row_block_counts,
+            ],
+        )
+        return z
 
     if alpha == 0.0 or x.nnz == 0 or y.nnz == 0:
         # Easy case
@@ -2205,8 +4195,10 @@ def bsr_mm(
                 y.ncol,
                 copied_z_nnz,
                 x.offsets,
+                x.row_ends,
                 x.columns,
                 y.offsets,
+                y.row_ends,
                 y.columns,
                 work_arrays._mm_row_min,
                 work_arrays._mm_block_counts,
@@ -2242,6 +4234,7 @@ def bsr_mm(
                 # If z is aliasing with x or y, need to save topology as well
                 wp.copy(src=z.columns, dest=work_arrays._old_z_columns, count=copied_z_nnz)
                 wp.copy(src=z.offsets, dest=work_arrays._old_z_offsets, count=z.nrow + 1)
+                wp.copy(src=z.row_ends, dest=work_arrays._old_z_row_ends, count=z.nrow)
 
         # Fill unmerged mm blocks rows and columns
         wp.launch(
@@ -2253,8 +4246,10 @@ def bsr_mm(
                 mm_nnz,
                 x.nrow,
                 x.offsets,
+                x.row_ends,
                 x.columns,
                 y.offsets,
+                y.row_ends,
                 y.columns,
                 work_arrays._mm_row_min,
                 work_arrays._mm_block_counts,
@@ -2303,10 +4298,12 @@ def bsr_mm(
                 ctypes.cast(summed_triplet_offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(summed_triplet_indices.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(z.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                ctypes.cast(z.row_ends.ptr, ctypes.POINTER(ctypes.c_int32)),
                 ctypes.cast(z.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
                 _optional_ctypes_pointer(nnz_buf, ctype=ctypes.c_int32),
                 _optional_ctypes_event(nnz_event),
             )
+        _bsr_set_compact_row_ends(z)
 
         # Resize z to fit mm result if necessary
         # If we are not reusing the product topology, this needs another synchronization
@@ -2328,6 +4325,7 @@ def bsr_mm(
                     work_arrays._mm_rows,
                     work_arrays._mm_cols,
                     z.offsets,
+                    z.row_ends,
                     z.columns,
                     _as_3d_array(work_arrays._old_z_values, z.block_shape),
                     z.scalar_values,
@@ -2367,9 +4365,11 @@ def bsr_mm(
             inputs=[
                 alpha,
                 work_arrays._old_z_offsets if x == z else x.offsets,
+                work_arrays._old_z_row_ends if x == z else x.row_ends,
                 work_arrays._old_z_columns if x == z else x.columns,
                 _as_3d_array(work_arrays._old_z_values, z.block_shape) if x == z else x.scalar_values,
                 work_arrays._old_z_offsets if y == z else y.offsets,
+                work_arrays._old_z_row_ends if y == z else y.row_ends,
                 work_arrays._old_z_columns if y == z else y.columns,
                 _as_3d_array(work_arrays._old_z_values, z.block_shape) if y == z else y.scalar_values,
                 None if masked else work_arrays._mm_row_min,
@@ -2377,6 +4377,7 @@ def bsr_mm(
                 None if masked else work_arrays._mm_src_blocks[summed_triplet_indices],
                 z.nrow,
                 z.offsets,
+                z.row_ends,
                 z.columns,
                 z.scalar_values,
             ],
@@ -2399,9 +4400,11 @@ def bsr_mm(
         inputs=[
             alpha,
             work_arrays._old_z_offsets if x == z else x.offsets,
+            work_arrays._old_z_row_ends if x == z else x.row_ends,
             work_arrays._old_z_columns if x == z else x.columns,
             work_arrays._old_z_values if x == z else x.values,
             work_arrays._old_z_offsets if y == z else y.offsets,
+            work_arrays._old_z_row_ends if y == z else y.row_ends,
             work_arrays._old_z_columns if y == z else y.columns,
             work_arrays._old_z_values if y == z else y.values,
             None if masked else work_arrays._mm_row_min,
@@ -2409,6 +4412,7 @@ def bsr_mm(
             None if masked else work_arrays._mm_src_blocks[summed_triplet_indices],
             z.nrow,
             z.offsets,
+            z.row_ends,
             z.columns,
             mm_values,
         ],
@@ -2424,6 +4428,7 @@ def make_bsr_mv_kernel(block_cols: int):
     def bsr_mv_kernel(
         alpha: Any,
         A_offsets: wp.array(dtype=int),
+        A_row_ends: wp.array(dtype=int),
         A_columns: wp.array(dtype=int),
         A_values: wp.array3d(dtype=Any),
         x: wp.array(dtype=Any),
@@ -2442,7 +4447,7 @@ def make_bsr_mv_kernel(block_cols: int):
 
         if alpha != scalar_zero:
             beg = A_offsets[row]
-            end = A_offsets[row + 1]
+            end = A_row_ends[row]
             for block in range(beg, end):
                 xs = A_columns[block] * block_cols
                 for col in range(wp.static(block_cols)):
@@ -2464,6 +4469,7 @@ def make_bsr_mv_tiled_kernel(tile_size: int):
     def bsr_mv_tiled_kernel(
         alpha: Any,
         A_offsets: wp.array(dtype=int),
+        A_row_ends: wp.array(dtype=int),
         A_columns: wp.array(dtype=int),
         A_values: wp.array3d(dtype=Any),
         x: wp.array(dtype=Any),
@@ -2485,7 +4491,7 @@ def make_bsr_mv_tiled_kernel(tile_size: int):
 
         if alpha != scalar_zero:
             block_beg = A_offsets[row]
-            col_count = (A_offsets[row + 1] - block_beg) * block_cols
+            col_count = (A_row_ends[row] - block_beg) * block_cols
 
             col = lane
             lane_sum = y.dtype(0)
@@ -2514,6 +4520,7 @@ def make_bsr_mv_transpose_kernel(block_rows: int):
         alpha: Any,
         A_row_count: int,
         A_offsets: wp.array(dtype=int),
+        A_row_ends: wp.array(dtype=int),
         A_columns: wp.array(dtype=int),
         A_values: wp.array3d(dtype=Any),
         x: wp.array(dtype=Any),
@@ -2521,7 +4528,7 @@ def make_bsr_mv_transpose_kernel(block_rows: int):
     ):
         block, subcol = wp.tid()
 
-        row = bsr_row_index(A_offsets, A_row_count, block)
+        row = _bsr_row_index_active(A_offsets, A_row_count, block, A_row_ends)
         if row == -1:
             return
 
@@ -2683,7 +4690,7 @@ def bsr_mv(
                 kernel=make_bsr_mv_transpose_kernel(block_rows=block_shape[1]),
                 device=A.values.device,
                 dim=(A.nnz, block_shape[0]),
-                inputs=[alpha, A.nrow, A.offsets, A.columns, A.scalar_values, x_view, y_view],
+                inputs=[alpha, A.nrow, A.offsets, A.row_ends, A.columns, A.scalar_values, x_view, y_view],
             )
     elif use_tiles:
         wp.launch(
@@ -2691,14 +4698,14 @@ def bsr_mv(
             device=A.values.device,
             dim=(nrow, block_shape[0], tile_size),
             block_dim=tile_size,
-            inputs=[alpha, A.offsets, A.columns, A.scalar_values, x_view, beta, y_view],
+            inputs=[alpha, A.offsets, A.row_ends, A.columns, A.scalar_values, x_view, beta, y_view],
         )
     else:
         wp.launch(
             kernel=make_bsr_mv_kernel(block_cols=block_shape[1]),
             device=A.values.device,
             dim=(nrow, block_shape[0]),
-            inputs=[alpha, A.offsets, A.columns, A.scalar_values, x_view, beta, y_view],
+            inputs=[alpha, A.offsets, A.row_ends, A.columns, A.scalar_values, x_view, beta, y_view],
         )
 
     return y
